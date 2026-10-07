@@ -168,3 +168,7 @@ ghostvt-test-<pid>`), never the user's.
 | `src/herdr/` | herdr's socket API, terminal streams, the session registry |
 | `src/daemon/` | The background process and its control socket |
 | `src/panes/`, `src/actions/` | The popup panes and the actions that open them |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
