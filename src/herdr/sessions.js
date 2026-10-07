@@ -614,23 +614,32 @@ export class SessionRegistry extends EventEmitter {
   }
 
   /// A controller ended that nothing here asked to end: someone else took
-  /// the terminal through herdr, or the terminal is gone.
+  /// the terminal through herdr, or its program exited. The holder stays
+  /// the holder until it is clear which: herdr's `pane_exited` may end the
+  /// session meanwhile, and it tells the holder the program exited — the
+  /// device closes the tab.
   async controllerClosed(session, controller, { reason, taken }) {
     if (session.controller !== controller) return;
     session.controller = null;
     session.gate = null;
+    if (!taken) {
+      for (let attempt = 0; attempt < 5 && this.sessions.has(session.sid); attempt++) {
+        let exists = true;
+        try {
+          exists = (await herdr.paneList()).some((pane) => pane.terminal_id === session.terminalID);
+        } catch {}
+        if (!exists) {
+          this.end(session, `its program exited (${reason})`);
+          this.save();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      // Ended already (by herdr's event), or held again by now.
+      if (!this.sessions.has(session.sid) || session.controller) return;
+    }
     const holder = session.holder;
     session.holder = null;
-    let exists = true;
-    try {
-      exists = (await herdr.paneList()).some((pane) => pane.terminal_id === session.terminalID);
-    } catch {}
-    if (!exists) {
-      session.holder = holder;
-      this.end(session, reason);
-      this.save();
-      return;
-    }
     this.log(`session ${session.sid}: herdr closed its stream (${reason})`);
     if (holder && !holder.peer.closed) holder.peer.sessionTaken(session.sid, taken ? "another herdr client" : undefined);
   }

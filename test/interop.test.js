@@ -283,6 +283,18 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     await device.close();
   });
 
+  test("a shell that exits (Ctrl-D) closes the device's tab", async () => {
+    const device = await connect("Device A");
+    const sid = num((await device.request(3, { cols: U(80), rows: U(24), cwdpath: os.tmpdir() })).sid);
+    await sleep(1000);
+    device.send(6, { sid: U(sid), data: D("\x04") });
+    const exit = await device.waitFor((event) => num(event.ev) === 101 && num(event.sid) === sid, 8000);
+    assert.equal(exit.exit.i64, "0");
+    assert.ok(!device.events.some((event) => num(event.ev) === 103 && num(event.sid) === sid), "not told it was taken");
+    assert.ok(!(await device.request(2)).sessions.some((entry) => num(entry.sid) === sid));
+    await device.close();
+  });
+
   test("an unpaired device cannot connect again", async () => {
     const status = await control("pair.open").then(() => control("pair.close"));
     assert.ok(status.ok);
