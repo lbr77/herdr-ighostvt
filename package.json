@@ -1,0 +1,13 @@
+{
+  "name": "herdr-ghostvt",
+  "version": "0.1.0",
+  "private": true,
+  "description": "herdr plugin: an iGhostVT host whose terminals are herdr's",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test --test-timeout=180000 test/*.test.js"
+  }
+}
