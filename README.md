@@ -107,9 +107,15 @@ few lines can be repeated or missed).
 Known differences from a terminal on an iGhostVT host:
 
 - Terminal modes are not forwarded (herdr's frames do not carry them):
-  bracketed paste, mouse reporting, application cursor keys, the kitty
-  keyboard protocol, focus events. Pasting several lines into a shell runs
-  them line by line; mouse input does not reach full-screen programs.
+  bracketed paste, application cursor keys, the kitty keyboard protocol,
+  focus events. Pasting several lines into a shell runs them line by line.
+- Full-screen programs (an agent's TUI, vim, less) keep their content out of
+  the scrollback and scroll themselves. While one runs, the device's terminal
+  reports the mouse and a swipe reaches the program the way the wheel does
+  in herdr's own window: as wheel events for a program that reads the mouse,
+  as arrow keys for one that does not. Taps reach it on herdr 0.9.2 and
+  later; on older herdr they are dropped. Raw mouse reports never go to a
+  program as typed input.
 - The bell and OSC 52 clipboard writes do not reach the device. The pane's
   title does: the bridge passes herdr's on.
 - A session is shown at one size at a time: the device holding it sets the

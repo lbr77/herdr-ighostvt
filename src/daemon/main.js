@@ -20,6 +20,15 @@ const log = makeLog();
 const HERDR_GONE_MS = 20_000;
 const relayFile = () => path.join(configDirectory(), "relay.vtrpsc");
 
+/// Whether a version like "0.9.3" is at least [major, minor, patch].
+function atLeast(version, minimum) {
+  const parts = String(version ?? "").split(".").map((part) => Number.parseInt(part, 10) || 0);
+  for (let index = 0; index < minimum.length; index++) {
+    if ((parts[index] ?? 0) !== minimum[index]) return (parts[index] ?? 0) > minimum[index];
+  }
+  return true;
+}
+
 async function waitForHerdr() {
   const deadline = Date.now() + 30_000;
   for (;;) {
@@ -42,7 +51,13 @@ async function main() {
   const pong = await waitForHerdr();
   log(`starting: herdr ${pong.version} at ${process.env.HERDR_SOCKET_PATH ?? "the default socket"}, host ${store.hostID}, ${store.devices.length} paired device(s)`);
 
-  const sessions = new SessionRegistry({ stateDir: stateDirectory(), workspaceLabel: config.workspace || "iGhostVT", expose: config.expose, log });
+  const sessions = new SessionRegistry({
+    stateDir: stateDirectory(),
+    workspaceLabel: config.workspace || "iGhostVT",
+    expose: config.expose,
+    clicks: atLeast(pong.version, [0, 9, 2]),
+    log,
+  });
   await sessions.start();
   const host = new RemoteHost({ store, sessions, log, config: { ...config, defaultName: sanitizedName(config.name || defaultHostName()) } });
   await host.listen();

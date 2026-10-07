@@ -20,6 +20,7 @@ import path from "node:path";
 import { Controller } from "./controller.js";
 import { compactFrame } from "./frames.js";
 import { paneSize } from "./ttysize.js";
+import { MOUSE_OFF, MOUSE_ON, splitMouse } from "./mouse.js";
 import { EventStream, HerdrError, herdr } from "./api.js";
 import { readJSON, writeFileAtomic } from "../store.js";
 import { CODE, MAXIMUM_COLUMNS, MAXIMUM_ROWS, RECONNECT_GRACE_MS } from "../remote/protocol.js";
@@ -74,6 +75,10 @@ class Session {
     this.terminalTitle = "";
     /// The pane's size before a device took it, put back when it lets go.
     this.naturalSize = null;
+    /// Whether the device's terminal reports the mouse (a full-screen
+    /// program runs), and a mouse report cut off between two writes.
+    this.mouse = null;
+    this.mousePending = "";
     this.proc = path.basename(process.env.SHELL || "zsh");
     this.fgShell = true;
     this.cwd = undefined;
@@ -99,8 +104,10 @@ class Session {
 }
 
 export class SessionRegistry extends EventEmitter {
-  constructor({ stateDir, workspaceLabel = "iGhostVT", expose = "all", log = () => {} }) {
+  constructor({ stateDir, workspaceLabel = "iGhostVT", expose = "all", clicks = false, log = () => {} }) {
     super();
+    /// herdr takes `terminal.mouse` (0.9.2 and later).
+    this.clicks = clicks;
     this.file = path.join(stateDir, "sessions.json");
     this.workspaceLabel = workspaceLabel;
     this.exposeAll = expose !== "workspace";
@@ -471,9 +478,11 @@ export class SessionRegistry extends EventEmitter {
     const first = gate.shift();
     const { bytes: lines, total } = await this.history(session).catch(() => ({ bytes: Buffer.alloc(0), total: null }));
     session.historySent = total;
-    const title = titleSequence(session);
-    const room = Math.max(0, REPLAY_BYTES - first.length - title.length);
-    return Buffer.concat([title, lines.length > room ? lines.subarray(lines.length - room) : lines, first]);
+    // Said either way: the device's terminal may still have it from before.
+    session.mouse = total === 0;
+    const head = Buffer.concat([titleSequence(session), session.mouse ? MOUSE_ON : MOUSE_OFF]);
+    const room = Math.max(0, REPLAY_BYTES - first.length - head.length);
+    return Buffer.concat([head, lines.length > room ? lines.subarray(lines.length - room) : lines, first]);
   }
 
   /// The reply for `sid` is out: frames held back go now.
@@ -535,15 +544,22 @@ export class SessionRegistry extends EventEmitter {
     try {
       const pane = await herdr.paneGet(session.paneID);
       const total = pane.scroll?.max_offset_from_bottom ?? 0;
+      // No history at all is what herdr says while a full-screen program
+      // (an agent's TUI, vim, less) has the alternate screen: its content
+      // never scrolls into history, it scrolls itself, by the wheel. The
+      // device's terminal then reports the mouse, so a swipe reaches it
+      // (`write`); the history the device holds stays as it is.
+      this.setMouse(session, total === 0);
+      if (total === 0) return;
       if (session.historySent === null || session.historySent === undefined) {
         session.historySent = total;
         return;
       }
       if (total < session.historySent) {
-        // The history was cleared (`clear`); so is the device's.
-        session.historySent = total;
-        if (total === 0) this.send(session, Buffer.from("\x1b[3J"));
-        return;
+        // The history was cleared (`clear`); so is the device's, and what
+        // came after goes in as new.
+        this.send(session, Buffer.from("\x1b[3J"));
+        session.historySent = 0;
       }
       if (total === session.historySent) return;
       const count = Math.min(total - session.historySent, SYNC_LINES);
@@ -567,6 +583,12 @@ export class SessionRegistry extends EventEmitter {
     } finally {
       session.syncing = false;
     }
+  }
+
+  setMouse(session, on) {
+    if (session.mouse === on) return;
+    session.mouse = on;
+    this.send(session, on ? MOUSE_ON : MOUSE_OFF);
   }
 
   /// The last `count` lines above the screen, or null when herdr's two
@@ -643,7 +665,10 @@ export class SessionRegistry extends EventEmitter {
     const session = this.held(peer, sid);
     if (!session) throw new SessionError(CODE.unknownSession);
     if (session.controller.child.stdin.writableLength > 4 << 20) throw new SessionError(CODE.inputBacklog);
-    session.controller.input(data);
+    const { input, commands, pending } = splitMouse(data, session.mousePending, { clicks: this.clicks });
+    session.mousePending = pending;
+    for (const command of commands) session.controller.send(command);
+    if (input.length) session.controller.input(input);
   }
 
   resize(peer, sid, cols, rows) {

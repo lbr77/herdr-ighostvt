@@ -244,6 +244,45 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     await device.close();
   });
 
+  test("a full-screen program scrolls by the device's swipe, and the scrollback stays", async () => {
+    const { request } = await import("../src/herdr/api.js");
+    const device = await connect("Device A");
+    const sid = num((await device.request(3, { cols: U(60), rows: U(15), cwdpath: os.tmpdir() })).sid);
+    const paneID = (await request("pane.list", {})).panes.at(-1).pane_id;
+    await sleep(800);
+    device.send(6, { sid: U(sid), data: D("clear; for i in $(seq 1 60); do echo row-$i; done; echo before-$((1+1))\r") });
+    await device.waitForOutput(sid, "before-2");
+    await sleep(1200);
+    const log = path.join(work, "fullscreen.log");
+    const mark = device.output(sid).length;
+    device.send(6, { sid: U(sid), data: D(`node ${path.join(ROOT, "test/support/fullscreen.js")} ${log}\r`) });
+    await device.waitFor(() => device.output(sid).slice(mark).includes("\x1b[?1000h\x1b[?1006h"), 8000);
+    assert.ok(!device.output(sid).slice(mark).includes("\x1b[3J"), "the device's scrollback is not cleared for it");
+
+    device.send(6, { sid: U(sid), data: D("\x1b[<64;10;5M\x1b[<65;10;5M") });
+    const events = await waitUntil(() => {
+      const lines = fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "";
+      return lines.includes("<64;") && lines.includes("<65;") && lines;
+    }, 5000, "the wheel at the program");
+    assert.ok(!events.includes("<64;10;5M"), "the device's report is not passed on as is");
+    assert.match(events, /<64;1;1M/, "herdr's wheel event arrives instead");
+
+    const after = device.output(sid).length;
+    device.send(6, { sid: U(sid), data: D("q") });
+    await device.waitFor(() => device.output(sid).slice(after).includes("\x1b[?1000l\x1b[?1006l"), 8000);
+    device.send(6, { sid: U(sid), data: D("\x1b[<64;10;5M") });
+    const scrolled = await waitUntil(async () => (await request("pane.get", { pane_id: paneID })).pane.scroll.offset_from_bottom > 0, 5000, "herdr's own scrolling");
+    assert.ok(scrolled);
+    const screen = (await request("pane.read", { pane_id: paneID, source: "visible", format: "text" })).read.text;
+    assert.ok(!screen.includes("64;10;5M"), "nothing of the report was typed into the shell");
+
+    const terminal = screenOf(device, sid, 60, 15);
+    const rows = terminal.scrollback.filter((line) => /^row-\d+$/.test(line)).map((line) => Number(line.slice(4)));
+    assert.ok(rows.length >= 45 && rows[0] === 1, `the scrollback from before is still there (${rows.length} rows)`);
+    await device.request(8, { sid: U(sid) });
+    await device.close();
+  });
+
   test("an unpaired device cannot connect again", async () => {
     const status = await control("pair.open").then(() => control("pair.close"));
     assert.ok(status.ok);
