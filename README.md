@@ -33,6 +33,17 @@ herdr plugin link /path/to/herdr-ghostvt
 The plugin's startup hook starts the bridge in the background when the herdr
 server starts; the plugin's actions start it too if it is not running yet.
 
+herdr runs plugin commands with its own environment, and a herdr server that
+launchd starts at login (`brew services`) has only
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin`. So every command goes through
+`bin/node.sh`, which finds Node on PATH, where Homebrew, mise, volta, nvm or
+nix put it, or through the login shell.
+
+herdr keeps a copy of the manifest from when the plugin was linked or
+installed: after an update that changes `herdr-plugin.toml`, link it again
+(`herdr plugin unlink ghostvt && herdr plugin link <path>`) or reinstall it.
+The plugin's state and configuration stay.
+
 ## Pair a device
 
 1. In herdr, run the action **Pair an iGhostVT device** (or
@@ -96,7 +107,10 @@ open with `herdr terminal session control` at the device's size: herdr sends
 frames of its own rendering of the screen, the bridge passes them on as the
 session's output (dropping redundant cursor moves and colours, which makes a
 full screen 10–20× smaller), and the device's input goes back as
-`terminal.input`.
+`terminal.input`. Frames go at most about 30 times a second: changes in
+between wait for the next one, or — when they add up to more than a
+repaint, or the link is backed up — are replaced by one repaint, so a slow
+link shows the latest screen rather than a queue of old ones.
 
 Because frames repaint the screen rather than scroll it, the bridge keeps the
 device's scrollback itself: an attach replays herdr's history before the
@@ -113,9 +127,14 @@ Known differences from a terminal on an iGhostVT host:
   the scrollback and scroll themselves. While one runs, the device's terminal
   reports the mouse and a swipe reaches the program the way the wheel does
   in herdr's own window: as wheel events for a program that reads the mouse,
-  as arrow keys for one that does not. Taps reach it on herdr 0.9.2 and
+  as arrow keys for one that does not. A fling is paced to the program's
+  drawing (a few steps queued at most, dropped when the swipe turns), so the
+  view stops when the finger does. Taps reach it on herdr 0.9.2 and
   later; on older herdr they are dropped. Raw mouse reports never go to a
-  program as typed input.
+  program as typed input. Selecting text still works there: on iPhone and
+  iPad a double tap selects a word, a triple tap a row, and the handles
+  extend it; in the Mac app, Shift-drag. A shell without history yet (new,
+  or just cleared) is not treated as full-screen.
 - The bell and OSC 52 clipboard writes do not reach the device. The pane's
   title does: the bridge passes herdr's on.
 - A session is shown at one size at a time: the device holding it sets the

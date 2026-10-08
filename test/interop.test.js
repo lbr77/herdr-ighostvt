@@ -244,6 +244,17 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     await device.close();
   });
 
+  test("a new shell leaves the device's own selecting and clicking alone", async () => {
+    const device = await connect("Device A");
+    const sid = num((await device.request(3, { cols: U(60), rows: U(12), cwdpath: os.tmpdir() })).sid);
+    device.send(6, { sid: U(sid), data: D("echo fresh-$((2*2))\r") });
+    await device.waitForOutput(sid, "fresh-4");
+    await sleep(2500);
+    assert.ok(!device.output(sid).includes("\x1b[?1000h"), "no mouse reporting for a shell without history");
+    await device.request(8, { sid: U(sid) });
+    await device.close();
+  });
+
   test("a full-screen program scrolls by the device's swipe, and the scrollback stays", async () => {
     const { request } = await import("../src/herdr/api.js");
     const device = await connect("Device A");
@@ -266,6 +277,21 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     }, 5000, "the wheel at the program");
     assert.ok(!events.includes("<64;10;5M"), "the device's report is not passed on as is");
     assert.match(events, /<64;1;1M/, "herdr's wheel event arrives instead");
+
+    // A fling: forty steps at once reach the program as a few, and turning
+    // back drops what still waited the other way.
+    const wheelEvents = (kind) => (fs.readFileSync(log, "utf8").match(new RegExp(`<${kind};`, "g")) ?? []).length;
+    let ups = wheelEvents(64);
+    device.send(6, { sid: U(sid), data: D("\x1b[<64;10;5M".repeat(40)) });
+    await sleep(1500);
+    const flungUp = wheelEvents(64) - ups;
+    assert.ok(flungUp >= 1 && flungUp <= 4, `a fling of 40 reached the program as ${flungUp}`);
+    ups = wheelEvents(64);
+    const downs = wheelEvents(65);
+    device.send(6, { sid: U(sid), data: D("\x1b[<64;10;5M".repeat(10) + "\x1b[<65;10;5M".repeat(10)) });
+    await sleep(1500);
+    assert.ok(wheelEvents(64) - ups <= 1, "steps up still waiting were dropped when the swipe turned");
+    assert.ok(wheelEvents(65) - downs >= 1 && wheelEvents(65) - downs <= 4);
 
     const after = device.output(sid).length;
     device.send(6, { sid: U(sid), data: D("q") });
@@ -292,6 +318,20 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     assert.equal(exit.exit.i64, "0");
     assert.ok(!device.events.some((event) => num(event.ev) === 103 && num(event.sid) === sid), "not told it was taken");
     assert.ok(!(await device.request(2)).sessions.some((entry) => num(entry.sid) === sid));
+    await device.close();
+  });
+
+  test("output faster than frames are sent still ends on the right screen", async () => {
+    const device = await connect("Device A");
+    const sid = num((await device.request(3, { cols: U(60), rows: U(12), cwdpath: os.tmpdir() })).sid);
+    await sleep(800);
+    device.send(6, { sid: U(sid), data: D("clear; for i in $(seq 1 4000); do printf '\\rcount-%d' $i; done; echo; echo done-$((1+2))\r") });
+    await device.waitForOutput(sid, "done-3", 15000);
+    await sleep(800);
+    const screen = screenOf(device, sid, 60, 12).screenLines();
+    assert.ok(screen.includes("count-4000"), `the last count is on the screen: ${JSON.stringify(screen)}`);
+    assert.ok(screen.includes("done-3"));
+    await device.request(8, { sid: U(sid) });
     await device.close();
   });
 

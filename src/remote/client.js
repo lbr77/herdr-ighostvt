@@ -20,6 +20,7 @@ const { u64, i64 } = xpc;
 /// Output toward a device that is not being taken by the network is held
 /// in herdr instead of here: above this much, its streams pause.
 const PAUSE_ABOVE_BYTES = 1 << 20;
+const CONGESTED_BYTES = 64 * 1024;
 
 export class RemoteClient {
   constructor({ socket, address, viaRelay, host }) {
@@ -96,6 +97,12 @@ export class RemoteClient {
       this.host.sessions.setPaused?.(this, true);
     }
     return true;
+  }
+
+  /// Output waiting to go out: frames for this device are then skipped
+  /// and a repaint sent when it has caught up.
+  congested() {
+    return this.socket.writableLength > CONGESTED_BYTES;
   }
 
   resume() {

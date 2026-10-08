@@ -37,6 +37,13 @@ const HISTORY_LINES = 5000;
 const SYNC_DELAY_MS = 300;
 const SYNC_LINES = 2000;
 const FULL_FRAME_TIMEOUT_MS = 1000;
+/// At most this often a frame goes to a device; what changes in between is
+/// shown by one repaint at the next slot (and so while its link is backed up).
+const FRAME_INTERVAL_MS = 33;
+/// Wheel steps waiting behind the one the program is drawing, and how long a
+/// step that draws nothing (the program is at its end) holds the next.
+const WHEEL_BACKLOG = 3;
+const WHEEL_WAIT_MS = 150;
 const SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "elvish", "xonsh", "pwsh", "login"]);
 
 export class SessionError extends Error {
@@ -309,7 +316,12 @@ export class SessionRegistry extends EventEmitter {
   async pollProcesses() {
     for (const session of this.sessions.values()) {
       if (!session.holder || session.holder.peer.closed) continue;
-      if (await this.refreshProcess(session)) this.announceForeground(session);
+      if (await this.refreshProcess(session)) {
+        this.announceForeground(session);
+        // A program came to the front or left it: whether the device's
+        // terminal reports the mouse may change with it.
+        this.scheduleSync(session);
+      }
     }
   }
 
@@ -479,7 +491,7 @@ export class SessionRegistry extends EventEmitter {
     const { bytes: lines, total } = await this.history(session).catch(() => ({ bytes: Buffer.alloc(0), total: null }));
     session.historySent = total;
     // Said either way: the device's terminal may still have it from before.
-    session.mouse = total === 0;
+    session.mouse = fullScreen(session, total);
     const head = Buffer.concat([titleSequence(session), session.mouse ? MOUSE_ON : MOUSE_OFF]);
     const room = Math.max(0, REPLAY_BYTES - first.length - head.length);
     return Buffer.concat([head, lines.length > room ? lines.subarray(lines.length - room) : lines, first]);
@@ -501,12 +513,15 @@ export class SessionRegistry extends EventEmitter {
       session.cols = frame.width;
       session.rows = frame.height;
     }
+    // The program drew: the next wheel step may go.
+    this.wheelDrawn(session);
     if (session.awaitingFull) {
-      // The device's screen was cleared to push history into its
-      // scrollback; changes against the old screen mean nothing until the
-      // repaint, and their synchronized-update end would show the blank.
+      // The device's screen is not the one these changes are against (it
+      // was cleared to push history into its scrollback, or frames were
+      // skipped); nothing goes until the repaint.
       if (!frame.full) return;
       session.awaitingFull = false;
+      session.updateOpen = false;
       clearTimeout(session.fullTimer);
     }
     const bytes = compactFrame(frame.bytes, frame.width || session.cols);
@@ -514,8 +529,116 @@ export class SessionRegistry extends EventEmitter {
       session.gate.push(bytes);
       return;
     }
+    if (frame.full) {
+      // Paints everything: what waited for the next slot is in it.
+      session.held = [];
+      session.heldBytes = 0;
+      session.fullBytes = bytes.length;
+      this.sendFrame(session, bytes);
+      return;
+    }
+    const now = Date.now();
+    const congested = session.holder?.peer.congested?.() ?? false;
+    if (!session.held?.length && !congested && now - (session.lastFrameAt ?? 0) >= FRAME_INTERVAL_MS) {
+      this.sendFrame(session, bytes);
+      return;
+    }
+    // Too soon after the last frame: it waits for the next slot, with what
+    // else comes until then — as is while that is less than a repaint of
+    // the whole screen, replaced by one repaint once it is more (a program
+    // redrawing everything, as scrolling does) or the link is backed up.
+    // The device then sees the latest screen, not a queue of old ones.
+    (session.held ??= []).push(bytes);
+    session.heldBytes = (session.heldBytes ?? 0) + bytes.length;
+    if (congested || session.heldBytes > (session.fullBytes ?? 8192)) {
+      session.held = [];
+      session.heldBytes = 0;
+      session.awaitingFull = true;
+    }
+    this.scheduleSlot(session, controller);
+  }
+
+  sendFrame(session, bytes) {
+    session.lastFrameAt = Date.now();
     this.send(session, bytes);
     this.scheduleSync(session);
+  }
+
+  scheduleSlot(session, controller) {
+    if (session.slotTimer) return;
+    const delay = Math.max(FRAME_INTERVAL_MS / 2, (session.lastFrameAt ?? 0) + FRAME_INTERVAL_MS - Date.now());
+    session.slotTimer = setTimeout(() => {
+      session.slotTimer = null;
+      if (session.controller !== controller) return;
+      if (session.holder?.peer.congested?.()) return this.scheduleSlot(session, controller);
+      if (session.awaitingFull) {
+        this.requestRepaint(session, controller);
+      } else if (session.held?.length) {
+        const held = Buffer.concat(session.held);
+        session.held = [];
+        session.heldBytes = 0;
+        this.sendFrame(session, held);
+      }
+    }, delay);
+  }
+
+  /// A full frame from herdr: a same-size resize, which the program never
+  /// notices. Asked once more if none comes; then the wait is given up (and
+  /// a synchronized update the sync opened is closed).
+  requestRepaint(session, controller) {
+    session.awaitingFull = true;
+    controller.resize(session.cols, session.rows);
+    clearTimeout(session.fullTimer);
+    session.fullTimer = setTimeout(() => {
+      if (!session.awaitingFull || session.controller !== controller) return;
+      controller.resize(session.cols, session.rows);
+      session.fullTimer = setTimeout(() => {
+        if (!session.awaitingFull) return;
+        session.awaitingFull = false;
+        if (session.updateOpen) this.send(session, Buffer.from("\x1b[?2026l"));
+        session.updateOpen = false;
+      }, FULL_FRAME_TIMEOUT_MS);
+    }, FULL_FRAME_TIMEOUT_MS);
+  }
+
+  // MARK: - The wheel
+  //
+  // Every wheel step reaches the program and makes it draw; a fling sends
+  // them faster than it draws, and far faster than its frames cross a
+  // relay. Queued, they would go on scrolling the program well after the
+  // finger stopped. So one step goes at a time, the next once the program
+  // drew, with only a few waiting; more are dropped, and turning back drops
+  // those still waiting the other way.
+
+  wheel(session, direction) {
+    const wheel = (session.wheel ??= { direction: null, pending: 0, drawing: false, timer: null });
+    if (wheel.direction !== direction) {
+      wheel.direction = direction;
+      wheel.pending = 0;
+    }
+    wheel.pending = Math.min(wheel.pending + 1, WHEEL_BACKLOG);
+    this.pumpWheel(session);
+  }
+
+  pumpWheel(session) {
+    const wheel = session.wheel;
+    if (!wheel || wheel.drawing || wheel.pending === 0 || !session.controller) return;
+    wheel.pending -= 1;
+    wheel.drawing = true;
+    session.controller.send({ type: "terminal.scroll", direction: wheel.direction, lines: 3 });
+    clearTimeout(wheel.timer);
+    wheel.timer = setTimeout(() => {
+      wheel.drawing = false;
+      this.pumpWheel(session);
+    }, WHEEL_WAIT_MS);
+  }
+
+  wheelDrawn(session) {
+    const wheel = session.wheel;
+    if (!wheel?.drawing) return;
+    wheel.drawing = false;
+    clearTimeout(wheel.timer);
+    this.pumpWheel(session);
   }
 
   // MARK: - Scrollback
@@ -548,8 +671,10 @@ export class SessionRegistry extends EventEmitter {
       // (an agent's TUI, vim, less) has the alternate screen: its content
       // never scrolls into history, it scrolls itself, by the wheel. The
       // device's terminal then reports the mouse, so a swipe reaches it
-      // (`write`); the history the device holds stays as it is.
-      this.setMouse(session, total === 0);
+      // (`write`); the history the device holds stays as it is. A shell
+      // with no history yet (new, or just cleared) is not one: there the
+      // device keeps its own selecting and clicking.
+      this.setMouse(session, fullScreen(session, total));
       if (total === 0) return;
       if (session.historySent === null || session.historySent === undefined) {
         session.historySent = total;
@@ -566,20 +691,9 @@ export class SessionRegistry extends EventEmitter {
       const lines = await this.historyLines(session, count);
       session.historySent = total;
       if (!lines || session.controller !== controller || session.gate || !session.holder) return;
-      session.awaitingFull = true;
       this.send(session, Buffer.from(`\x1b[?2026h\x1b[0m\x1b[H\x1b[2J${lines.join("\r\n")}\x1b[0m${"\r\n".repeat(session.rows)}`, "utf8"));
-      controller.resize(session.cols, session.rows);
-      clearTimeout(session.fullTimer);
-      session.fullTimer = setTimeout(() => {
-        if (!session.awaitingFull || session.controller !== controller) return;
-        // No repaint came: ask once more, then stop holding the update.
-        controller.resize(session.cols, session.rows);
-        session.fullTimer = setTimeout(() => {
-          if (!session.awaitingFull) return;
-          session.awaitingFull = false;
-          this.send(session, Buffer.from("\x1b[?2026l"));
-        }, FULL_FRAME_TIMEOUT_MS);
-      }, FULL_FRAME_TIMEOUT_MS);
+      session.updateOpen = true;
+      this.requestRepaint(session, controller);
     } finally {
       session.syncing = false;
     }
@@ -653,6 +767,12 @@ export class SessionRegistry extends EventEmitter {
   letGo(session) {
     clearTimeout(session.lingerTimer);
     session.lingerTimer = null;
+    clearTimeout(session.slotTimer);
+    session.slotTimer = null;
+    session.held = [];
+    session.heldBytes = 0;
+    if (session.wheel) clearTimeout(session.wheel.timer);
+    session.wheel = null;
     session.holder = null;
     session.gate = null;
     if (session.controller) {
@@ -676,7 +796,10 @@ export class SessionRegistry extends EventEmitter {
     if (session.controller.child.stdin.writableLength > 4 << 20) throw new SessionError(CODE.inputBacklog);
     const { input, commands, pending } = splitMouse(data, session.mousePending, { clicks: this.clicks });
     session.mousePending = pending;
-    for (const command of commands) session.controller.send(command);
+    for (const command of commands) {
+      if (command.type === "terminal.scroll") this.wheel(session, command.direction);
+      else session.controller.send(command);
+    }
     if (input.length) session.controller.input(input);
   }
 
@@ -797,4 +920,10 @@ function isDirectory(directory) {
 function titleSequence(session) {
   const title = session.terminalTitle.replace(/[\x00-\x1f\x7f]/g, "").slice(0, 256);
   return title ? Buffer.from(`\x1b]2;${title}\x07`, "utf8") : Buffer.alloc(0);
+}
+
+/// A full-screen program has the pane: no history (the alternate screen)
+/// and something other than the shell in front.
+function fullScreen(session, total) {
+  return total === 0 && !session.fgShell;
 }
