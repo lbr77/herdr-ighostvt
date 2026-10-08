@@ -8,21 +8,21 @@ platforms = ["macos", "linux"]
 # Starts the bridge daemon in the background (it outlives this hook and ends
 # with the herdr server).
 [[startup]]
-command = ["node", "src/start.js"]
+command = ["sh", "bin/node.sh", "src/start.js"]
 
 [[actions]]
 id = "pair"
 title = "Pair an iGhostVT device"
 description = "Show a six-digit code to enter in iGhostVT"
 contexts = ["global"]
-command = ["node", "src/actions/open-pane.js", "pair"]
+command = ["sh", "bin/node.sh", "src/actions/open-pane.js", "pair"]
 
 [[actions]]
 id = "panel"
 title = "iGhostVT bridge"
 description = "Paired devices, relay and status of the iGhostVT bridge"
 contexts = ["global"]
-command = ["node", "src/actions/open-pane.js", "panel"]
+command = ["sh", "bin/node.sh", "src/actions/open-pane.js", "panel"]
 
 [[panes]]
 id = "pair"
@@ -30,7 +30,7 @@ title = "Pair an iGhostVT device"
 placement = "popup"
 width = "70%"
 height = "60%"
-command = ["node", "src/panes/pair.js"]
+command = ["sh", "bin/node.sh", "src/panes/pair.js"]
 
 [[panes]]
 id = "panel"
@@ -38,4 +38,4 @@ title = "iGhostVT bridge"
 placement = "popup"
 width = "80%"
 height = "70%"
-command = ["node", "src/panes/panel.js"]
+command = ["sh", "bin/node.sh", "src/panes/panel.js"]
