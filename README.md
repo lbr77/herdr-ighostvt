@@ -96,6 +96,7 @@ Optional, in the plugin's config directory (`herdr plugin config-dir ghostvt`),
 | `session` | The herdr session the bridge serves (a name given to `herdr --session`) | the default session |
 | `appVersion` | The iGhostVT release line to speak; only 1.6 is implemented, so remove an older value | `1.6.0` |
 | `bonjour` | `false` to not advertise on the local network | `true` |
+| `autoUpdate` | `false` to not install new releases on its own | `true` |
 
 iGhostVT's own host on the same Mac holds port 46404; the bridge then takes
 the next free one and advertises it. Devices that find the host over Bonjour
@@ -169,8 +170,33 @@ node src/cli.js pair [--relay]
 node src/cli.js unpair <device id>
 node src/cli.js relay import <file> | relay remove
 node src/cli.js rename [name]
-node src/cli.js start | stop
+node src/cli.js update [--check]
+node src/cli.js start | stop | restart
 ```
+
+## Updates
+
+The bridge keeps itself at its newest release: the highest `vX.Y.Z` tag on
+this repository. It looks a minute after it starts and every six hours
+after that, and puts a newer release in place by the way herdr has the
+plugin:
+
+- Installed from GitHub (`herdr plugin install lbr77/herdr-ighostvt`): it
+  reinstalls at the release's tag, which is how herdr refreshes a managed
+  plugin (`herdr plugin install … --ref vX.Y.Z --yes`).
+- Linked from a working tree (`herdr plugin link`): it fast-forwards the
+  tree to the tag, only when the tree has no uncommitted changes and the
+  tag is ahead of it. A tree with commits of its own is left alone.
+
+Then the bridge restarts into the new version. Devices reconnect within
+seconds; herdr's terminals are not touched. `node src/cli.js update` does
+the same at once, `--check` only looks, and the panel and `status` say
+where things stand. `autoUpdate: false` in `config.json` turns the
+automatic part off.
+
+To release: set the same `version` in `herdr-plugin.toml` and
+`package.json`, commit, tag it `v` + that version, and push the tag
+(`git push origin vX.Y.Z`).
 
 ## Development
 

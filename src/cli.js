@@ -7,16 +7,18 @@
 //   node src/cli.js relay import <file.vtrpsc>
 //   node src/cli.js relay remove
 //   node src/cli.js rename [name]
-//   node src/cli.js start | stop
+//   node src/cli.js update [--check]        installs the newest release (or only looks)
+//   node src/cli.js start | stop | restart
 
 import fs from "node:fs";
 import { command, ensureDaemon, isRunning } from "./daemon/control.js";
+import { describeUpdate } from "./daemon/updater.js";
 
 const [verb, ...rest] = process.argv.slice(2);
 
-async function ask(cmd, fields) {
+async function ask(cmd, fields, options) {
   await ensureDaemon();
-  const answer = await command(cmd, fields);
+  const answer = await command(cmd, fields, options);
   if (answer.ok === false) throw new Error(answer.error);
   return answer;
 }
@@ -27,6 +29,7 @@ function print(status) {
     `port     ${status.port}, iGhostVT ${status.appVersion}`,
     `relay    ${status.relay ? `${status.relay.name ?? ""} ${status.relay.endpoint ?? ""} ${status.relay.state}${status.relay.message ? ` (${status.relay.message})` : ""}` : "none"}`,
     `sessions ${status.sessions} ${status.expose === "workspace" ? `in workspace "${status.workspace}"` : `(every herdr pane; new ones open in "${status.workspace}")`}`,
+    `updates  ${describeUpdate(status.update)}`,
     "devices",
     ...status.devices.map((device) => `  ${device.id}  ${device.name}${device.connected ? "  connected" : ""}`),
   ];
@@ -57,6 +60,13 @@ try {
     case "rename":
       print(await ask("rename", { name: rest.join(" ") }));
       break;
+    case "update": {
+      // A GitHub install clones; give it time.
+      const { update } = await ask("update", { install: !rest.includes("--check") }, { timeoutMs: 180_000 });
+      process.stdout.write(`${describeUpdate(update)}\n`);
+      if (update.state === "failed" || update.state === "skipped") process.exitCode = 1;
+      break;
+    }
     case "start":
       process.stdout.write((await ensureDaemon()) ? "started\n" : "already running\n");
       break;
@@ -64,8 +74,34 @@ try {
       if (await isRunning()) await command("stop");
       process.stdout.write("stopped\n");
       break;
+    case "restart": {
+      if (!(await isRunning())) {
+        await ensureDaemon();
+        process.stdout.write("started\n");
+        break;
+      }
+      const answer = await command("restart");
+      if (answer.ok === false) {
+        // A daemon from before `restart`: stopped and started instead.
+        await command("stop");
+        for (let tries = 0; tries < 50 && (await isRunning()); tries++) await new Promise((resolve) => setTimeout(resolve, 100));
+        await ensureDaemon();
+        process.stdout.write("restarted\n");
+        break;
+      }
+      const { pid } = answer;
+      const deadline = Date.now() + 20_000;
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const answer = await command("ping", {}, { timeoutMs: 1500 }).catch(() => null);
+        if (answer?.ok && answer.pid !== pid) break;
+        if (Date.now() > deadline) throw new Error("the bridge did not come back; see its log");
+      }
+      process.stdout.write("restarted\n");
+      break;
+    }
     default:
-      process.stderr.write("usage: cli.js status|pair [--relay]|unpair <id>|relay import <file>|relay remove|rename [name]|start|stop\n");
+      process.stderr.write("usage: cli.js status|pair [--relay]|unpair <id>|relay import <file>|relay remove|rename [name]|update [--check]|start|stop|restart\n");
       process.exitCode = 2;
   }
 } catch (error) {

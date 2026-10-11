@@ -7,6 +7,7 @@ import os from "node:os";
 import { BOLD, DIM, GREEN, RED, RESET, REVERSE, YELLOW, ago, daemon, draw, onKeys, prompt } from "./ui.js";
 import { runPairing } from "./pairing.js";
 import { logPath } from "../daemon/paths.js";
+import { describeUpdate } from "../daemon/updater.js";
 
 let status = null;
 let error = null;
@@ -36,6 +37,7 @@ function render() {
   const relay = status.relay;
   lines.push(`Relay       ${relay ? `${relay.name ?? ""} ${relay.endpoint ?? ""} · ${RELAY_STATE[relay.state] ?? relay.state}${relay.message && relay.state !== "registered" ? ` ${DIM}(${relay.message})${RESET}` : ""}` : `${DIM}none${RESET}`}`);
   lines.push(`Terminals   ${status.sessions} ${status.expose === "workspace" ? `in the "${status.workspace}" workspace` : `· every herdr pane; new tabs open in "${status.workspace}"`}`);
+  lines.push(`Updates     ${describeUpdate(status.update)}`);
   lines.push("", `${BOLD}Paired devices${RESET}`);
   if (!status.devices.length) lines.push(`  ${DIM}none yet: press p to pair one${RESET}`);
   status.devices.forEach((device, index) => {

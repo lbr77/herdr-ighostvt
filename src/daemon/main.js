@@ -2,6 +2,7 @@
 // in the background by the plugin's startup hook (src/start.js) or by any of
 // its actions, and gone when herdr is.
 
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { herdr } from "../herdr/api.js";
@@ -12,7 +13,8 @@ import { RelayLink, parseRelayConfiguration } from "../remote/relay.js";
 import { Store, configDirectory, defaultHostName, loadConfig, stateDirectory, writeFileAtomic } from "../store.js";
 import { sanitizedName } from "../remote/protocol.js";
 import { serveControl, isRunning } from "./control.js";
-import { makeLog } from "./paths.js";
+import { logPath, makeLog } from "./paths.js";
+import { PLUGIN_ROOT, Updater } from "./updater.js";
 
 const log = makeLog();
 /// herdr gone for this long ends the daemon; the startup hook brings it
@@ -41,7 +43,39 @@ async function waitForHerdr() {
   }
 }
 
+/// A daemon started by an update waits for the one it replaces to be gone,
+/// so the port and the control socket are free when it takes them.
+async function waitForPredecessor() {
+  const pid = Number.parseInt(process.env.GHOSTVT_AFTER_PID ?? "", 10);
+  delete process.env.GHOSTVT_AFTER_PID;
+  if (!pid) return;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/// Starts the daemon of the checkout at `root`, to take over once this one
+/// has exited.
+function startSuccessor(root) {
+  const output = fs.openSync(logPath(), "a", 0o600);
+  const child = spawn(process.execPath, [path.join(root, "src", "daemon", "main.js")], {
+    cwd: root,
+    detached: true,
+    stdio: ["ignore", output, output],
+    env: { ...process.env, GHOSTVT_AFTER_PID: String(process.pid) },
+  });
+  child.unref();
+  fs.closeSync(output);
+}
+
 async function main() {
+  await waitForPredecessor();
   if (await isRunning()) {
     log("another bridge is already running; this one stops");
     return;
@@ -97,6 +131,18 @@ async function main() {
   };
   startRelay();
 
+  let successorRoot = null;
+  const updater = new Updater({
+    log,
+    enabled: config.autoUpdate !== false,
+    restart: (root, tag) => {
+      successorRoot = root;
+      // After the answer to whoever asked for it has gone out.
+      setTimeout(() => shutdown(`updated to ${tag}`), 200);
+    },
+  });
+  updater.start();
+
   const status = () => ({
     ok: true,
     hostID: store.hostID,
@@ -120,6 +166,7 @@ async function main() {
     })),
     pairing: host.pairing.status(),
     sessions: sessions.sessions.size,
+    update: updater.status,
   });
 
   const control = serveControl(async (request) => {
@@ -159,6 +206,14 @@ async function main() {
         log("relay removed");
         startRelay();
         return status();
+      case "update":
+        return { ok: true, update: await updater.update({ install: request.install !== false }) };
+      case "restart":
+        // A fresh daemon from this checkout, on the same port, once this
+        // one has let go of it.
+        successorRoot = PLUGIN_ROOT;
+        setTimeout(() => shutdown("asked to restart"), 50);
+        return { ok: true, pid: process.pid };
       case "stop":
         setTimeout(() => shutdown("asked to stop"), 50);
         return { ok: true };
@@ -172,13 +227,20 @@ async function main() {
     if (stopping) return;
     stopping = true;
     log(`stopping: ${why}`);
+    updater.stop();
     advertisement.stop();
     relay?.stop();
     host.close();
     sessions.stop();
     control.close();
-    // Long enough for the panes devices held to get their size back.
-    setTimeout(() => process.exit(0), 800).unref();
+    // Long enough for the panes devices held to get their size back. A
+    // daemon with a successor to start waits it out; one without may be
+    // done sooner, once everything above has closed.
+    const timer = setTimeout(() => {
+      if (successorRoot) startSuccessor(successorRoot);
+      process.exit(0);
+    }, 800);
+    if (!successorRoot) timer.unref();
   }
 
   sessions.on("herdrLost", async (since) => {

@@ -80,7 +80,7 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     work = fs.mkdtempSync(path.join(os.tmpdir(), "ghostvt-"));
     fs.mkdirSync(path.join(work, "state"));
     fs.mkdirSync(path.join(work, "config"));
-    fs.writeFileSync(path.join(work, "config", "config.json"), JSON.stringify({ port: 0, name: "Bridge Test", bonjour: false }));
+    fs.writeFileSync(path.join(work, "config", "config.json"), JSON.stringify({ port: 0, name: "Bridge Test", bonjour: false, autoUpdate: false }));
     Object.assign(process.env, {
       HERDR_SOCKET_PATH: SOCKET,
       HERDR_PLUGIN_STATE_DIR: path.join(work, "state"),
@@ -423,6 +423,22 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
       fs.rmSync(path.dirname(begun.path), { recursive: true, force: true });
       await device.close();
     }
+  });
+
+  test("a restart hands the port to a fresh daemon, and devices come back", async () => {
+    const before = await control("status");
+    assert.equal(before.update.state, "off", "the test config turns automatic updates off");
+    await control("restart");
+    const after = await waitUntil(async () => {
+      const status = await control("status");
+      return status.pid !== before.pid && status;
+    }, 20_000, "the new daemon");
+    // Port 0 in this config: the system picks one again. (A configured
+    // port is taken again once the old daemon has let go of it.)
+    port = after.port;
+    const device = await connect("Device A");
+    assert.equal(num((await device.request(2)).code), 0);
+    await device.close();
   });
 
   describe("through the relay", { skip: fs.existsSync(RELAY) ? false : "relay not built (make -C interop)" }, () => {
