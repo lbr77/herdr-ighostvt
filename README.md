@@ -10,14 +10,16 @@ device can pick up, and a tab the app opens is a new tab in herdr's
 **iGhostVT** workspace.
 
 The app needs no change: the plugin speaks iGhostVT's own remote protocol
-(TLS 1.2 PSK, SPAKE2+ pairing, the IOWire session frames) and its relay
-protocol.
+(TLS 1.2 PSK, SPAKE2+ pairing, the IOWire session frames of protocol 2,
+with the LZFSE frame compression and link window of iGhostVT 1.6) and its
+relay protocol.
 
 ## Requirements
 
 - herdr 0.8.0 or newer
 - Node.js 20 or newer (no npm packages)
-- iGhostVT 1.4 on the other devices (the plugin speaks the 1.4 release line)
+- iGhostVT 1.6 on the other devices (the plugin speaks the 1.6 release line;
+  iGhostVT connects only within one major.minor line)
 - For the local network: macOS (`dns-sd`, built in) or Linux with
   `avahi-publish` (avahi-utils). Without either, devices reach the host only
   through the relay.
@@ -92,7 +94,7 @@ Optional, in the plugin's config directory (`herdr plugin config-dir ghostvt`),
 | `workspace` | The herdr workspace new terminals open in | `iGhostVT` |
 | `expose` | `all`: every herdr pane is a session; `workspace`: only the panes in that workspace | `all` |
 | `session` | The herdr session the bridge serves (a name given to `herdr --session`) | the default session |
-| `appVersion` | The iGhostVT release line to speak | `1.4.0` |
+| `appVersion` | The iGhostVT release line to speak; only 1.6 is implemented, so remove an older value | `1.6.0` |
 | `bonjour` | `false` to not advertise on the local network | `true` |
 
 iGhostVT's own host on the same Mac holds port 46404; the bridge then takes
@@ -110,7 +112,10 @@ full screen 10–20× smaller), and the device's input goes back as
 `terminal.input`. Frames go at most about 30 times a second: changes in
 between wait for the next one, or — when they add up to more than a
 repaint, or the link is backed up — are replaced by one repaint, so a slow
-link shows the latest screen rather than a queue of old ones.
+link shows the latest screen rather than a queue of old ones. "Backed up"
+counts what the device has not yet said it received, so the TCP buffers on
+the way (a relay's among them) cannot hide a backlog; frames of 1 KiB and up
+cross compressed, so a reattach's history replay is a fraction of its size.
 
 Because frames repaint the screen rather than scroll it, the bridge keeps the
 device's scrollback itself: an attach replays herdr's history before the
@@ -189,7 +194,7 @@ ghostvt-test-<pid>`), never the user's.
 |---|---|
 | `src/remote/` | The iGhostVT host: listener, client protocol, pairing, relay, Bonjour |
 | `src/crypto/` | P-256 and SPAKE2+ (corecrypto's variant) |
-| `src/wire/` | IOWire frames and the XPC value codec |
+| `src/wire/` | IOWire frames, the XPC value codec, and an LZVN encoder for frame compression |
 | `src/herdr/` | herdr's socket API, terminal streams, the session registry |
 | `src/daemon/` | The background process and its control socket |
 | `src/panes/`, `src/actions/` | The popup panes and the actions that open them |

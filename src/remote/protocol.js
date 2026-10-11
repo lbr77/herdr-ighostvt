@@ -3,7 +3,9 @@
 
 import crypto from "node:crypto";
 
-export const PROTOCOL_VERSION = 1n;
+/// Every request and reply carries it (`v`); a mismatch is
+/// `unsupportedVersion` both ways. 2 since iGhostVT 1.5.0.
+export const PROTOCOL_VERSION = 2n;
 
 export const OP = Object.freeze({
   hello: 1n,
@@ -20,6 +22,7 @@ export const OP = Object.freeze({
   listShells: 13n,
   setSessionAttributes: 14n,
   uploadFile: 15n,
+  hostUpdate: 16n,
   pairStart: 30n,
   pairFinish: 31n,
   ping: 32n,
@@ -62,10 +65,26 @@ export const PAIRING_WINDOW_MS = 120_000;
 export const PAIRING_ATTEMPT_LIMIT = 3;
 export const PAIRING_FINISH_MS = 30_000;
 export const HANDSHAKE_TIMEOUT_MS = 10_000;
+/// Connections not yet past their first frame, at once, per path; past
+/// that, up to `MAXIMUM_WAITING_CONNECTIONS` more wait unstarted for a slot
+/// (a window of tabs reconnects all at once), each for the handshake's
+/// timeout at most.
 export const MAXIMUM_UNAUTHENTICATED_CONNECTIONS = 4;
+export const MAXIMUM_WAITING_CONNECTIONS = 32;
 export const MAXIMUM_UNAUTHENTICATED_PAYLOAD_BYTES = 16 * 1024;
 export const RECONNECT_GRACE_MS = 30_000;
-export const RELAYED_SILENCE_LIMIT_MS = 60_000;
+/// A device on this release line pings a link that has been quiet for 5 s
+/// in either direction, so one not heard from for this long is gone —
+/// direct or relayed.
+export const DEVICE_SILENCE_LIMIT_MS = 30_000;
+/// The most output kept in flight toward a device past what it said it
+/// received (`rcvd`, sent every `LINK_RECEIPT_BYTES`): the TCP buffers on
+/// the way, a relay's two legs among them, hold far more than this side's
+/// own queue shows.
+export const LINK_WINDOW_BYTES = 1 << 20;
+export const LINK_RECEIPT_BYTES = 256 * 1024;
+/// What a device's hello offers in `cmpr`: LZFSE per frame.
+export const COMPRESSION_ALGORITHM = 1n;
 export const MAXIMUM_DEVICE_COUNT = 32;
 export const MAXIMUM_NAME_BYTES = 64;
 
@@ -79,9 +98,9 @@ export const UPLOAD_CHUNK_BYTES = 256 * 1024;
 export const MAXIMUM_UPLOAD_BYTES = 4n << 30n;
 export const MAXIMUM_PENDING_UPLOADS = 16;
 
-/// The iGhostVT release line this host speaks: the operation set of 1.4.
+/// The iGhostVT release line this host speaks: the operation set of 1.6.
 /// Devices talk only on the same major.minor, so this follows the app.
-export const DEFAULT_APP_VERSION = "1.4.0";
+export const DEFAULT_APP_VERSION = "1.6.0";
 export const UNKNOWN_VERSION = "0";
 
 function releaseLine(version) {

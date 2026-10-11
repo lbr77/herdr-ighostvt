@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as xpc from "../src/wire/xpc.js";
-import { FrameReader, encodeFrame, KIND, HEADER_BYTES } from "../src/wire/frame.js";
+import { FrameReader, compressedFrame, encodeFrame, KIND, HEADER_BYTES } from "../src/wire/frame.js";
 
 test("a dictionary encodes as IOCodec lays it out", () => {
   const bytes = xpc.encode({ v: xpc.u64(1), code: xpc.i64(-1) });
@@ -72,4 +72,21 @@ test("a frame over the limit or of an unknown kind ends the stream", () => {
   const bad = encodeFrame(KIND.request, 1, {});
   bad[4] = 9;
   assert.throws(() => new FrameReader().push(bad), /unknown kind/);
+});
+
+test("a compressed frame says so, with the plain length before the stream", () => {
+  const payload = xpc.encode({ v: xpc.u64(2), ev: xpc.u64(100), data: Buffer.alloc(8000, 0x41) });
+  const frame = compressedFrame(KIND.event, 0, payload);
+  assert.equal(frame[4], KIND.event);
+  assert.equal(frame[5], 1);
+  assert.equal(frame.readUInt32LE(0), frame.length - HEADER_BYTES);
+  assert.equal(frame.readUInt32LE(HEADER_BYTES), payload.length);
+  assert.equal(frame.subarray(HEADER_BYTES + 4, HEADER_BYTES + 8).toString("latin1"), "bvxn");
+  assert.equal(compressedFrame(KIND.event, 0, xpc.encode({ data: Buffer.from("abc") })), null, "too small to save an eighth");
+});
+
+test("a device's frame with flags set ends the stream", () => {
+  const flagged = encodeFrame(KIND.request, 1, { v: xpc.u64(2) });
+  flagged[5] = 1;
+  assert.throws(() => new FrameReader().push(flagged), /flags 1/);
 });

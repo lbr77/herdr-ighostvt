@@ -8,7 +8,12 @@
 //   ghostvt-client connect <host> <port> <hostID> <deviceID> <keyHex> <appVersion> [deviceName]
 //       sends hello with the proof, prints {"kind":"ready"} once answered, then
 //       sends each stdin line {"tag":n,"msg":{…}} as a request and prints each
-//       frame that arrives as {"kind":"reply"|"event","tag":n,"msg":{…}}
+//       frame that arrives as {"kind":"reply"|"event","tag":n,"msg":{…}}.
+//       As the app does, the hello offers compression (unless GHOSTVT_PLAIN
+//       is set) and says the link reports what it receives, and a receipt
+//       goes out every 256 KiB. A stdin line {"stats":true} prints
+//       {"kind":"stats","received":n,"wire":n}: frame bytes as decoded, and
+//       as they crossed the network.
 //
 // Values in JSON: strings and booleans as themselves, {"u64":"n"},
 // {"i64":"n"}, {"data":"base64"}, arrays and objects.
@@ -116,7 +121,7 @@ case "pair":
     let frames = open(host: host, port: port, hostID: hostID, key: RemoteTLS.Key(identity: RemoteAccess.pairingIdentity, secret: RemoteAccess.pairingKey))
     var step = 0
     frames.onReady = {
-        let start = request(["v": ["u64": "1"], "op": ["u64": "30"], "devid": deviceID, "devname": deviceName, "appver": appVersion])
+        let start = request(["v": ["u64": String(iGhostVTProtocol.version)], "op": ["u64": "30"], "devid": deviceID, "devname": deviceName, "appver": appVersion])
         let share = try! exchange.makeShare()
         share.withUnsafeBytes { xpc_dictionary_set_data(start, "share", $0.baseAddress!, share.count) }
         frames.send(.request, tag: 1, object: start)
@@ -139,7 +144,7 @@ case "pair":
                 try exchange.receiveShare(share)
                 let sessionKey = try exchange.verifyConfirmation(confirmation)
                 let deviceKey = PairingExchange.deviceKey(sessionKey: sessionKey, hostID: hostID, deviceID: deviceID)
-                let finish = request(["v": ["u64": "1"], "op": ["u64": "31"]])
+                let finish = request(["v": ["u64": String(iGhostVTProtocol.version)], "op": ["u64": "31"]])
                 let mine = try exchange.makeConfirmation()
                 mine.withUnsafeBytes { xpc_dictionary_set_data(finish, "confirm", $0.baseAddress!, mine.count) }
                 frames.send(.request, tag: 2, object: finish)
@@ -168,15 +173,22 @@ case "connect":
     let deviceName = arguments.count > 8 ? arguments[8] : "Interop"
     let frames = open(host: host, port: port, hostID: hostID, key: RemoteTLS.Key(identity: Data(deviceID.utf8), secret: key))
     var ready = false
+    let offersCompression = ProcessInfo.processInfo.environment["GHOSTVT_PLAIN"] == nil
+    frames.acceptsCompressedInput = offersCompression
     frames.onReady = {
         guard let exporter = RemoteTLS.exporterSecret(of: frames.connection) else { fail("no exporter secret") }
         if ProcessInfo.processInfo.environment["GHOSTVT_DEBUG"] != nil { FileHandle.standardError.write(Data("exporter \(hex(exporter))\n".utf8)) }
-        let hello = request(["v": ["u64": "1"], "op": ["u64": "1"], "devid": deviceID, "devname": deviceName, "appver": appVersion])
+        let hello = request(["v": ["u64": String(iGhostVTProtocol.version)], "op": ["u64": "1"], "devid": deviceID, "devname": deviceName, "appver": appVersion])
+        xpc_dictionary_set_uint64(hello, iGhostVTWireKey.received, 0)
+        if offersCompression {
+            RemoteFrameCompression.offer(in: hello)
+        }
         let proof = RemoteDeviceProof.make(key: key, exporterSecret: exporter, deviceID: deviceID)
         proof.withUnsafeBytes { xpc_dictionary_set_data(hello, "confirm", $0.baseAddress!, proof.count) }
         frames.send(.request, tag: 1, object: hello)
     }
     frames.onFrame = { header, object in
+        frames.acknowledgeReceived()
         if !ready {
             ready = true
             let code = xpc_dictionary_get_int64(object, "code")
@@ -188,9 +200,13 @@ case "connect":
             Thread.detachNewThread {
                 while let line = readLine() {
                     guard let data = line.data(using: .utf8),
-                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          let message = object["msg"]
+                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                     else { continue }
+                    if object["stats"] != nil {
+                        queue.async { emit(["kind": "stats", "received": frames.receivedByteCount, "wire": frames.receivedWireByteCount]) }
+                        continue
+                    }
+                    guard let message = object["msg"] else { continue }
                     let tag = (object["tag"] as? NSNumber)?.uint64Value ?? 0
                     let xpcMessage = xpcValue(message)
                     queue.async { frames.send(.request, tag: tag, object: xpcMessage) }

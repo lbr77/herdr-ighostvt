@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -122,11 +123,67 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
   });
 
   test("refuses another release line, and a key it does not know", async () => {
-    const other = await connect("Device A", { appVersion: "1.5.0" });
-    assert.equal(other.refused?.code, 2);
-    assert.equal(other.refused.msg.appver, "1.4.0");
-    await other.close();
+    for (const appVersion of ["1.4.0", "1.5.0"]) {
+      const other = await connect("Device A", { appVersion });
+      assert.equal(other.refused?.code, 2);
+      assert.equal(other.refused.msg.appver, "1.6.0");
+      await other.close();
+    }
+    const patch = await connect("Device A", { appVersion: "1.6.3" });
+    assert.equal(patch.refused, undefined, "every patch of the line talks to every other");
+    await patch.close();
     await assert.rejects(Device.connect({ port, hostID, deviceID: devices["Device A"].deviceID, key: "00".repeat(32) }));
+  });
+
+  test("speaks protocol 2, and answers a device's update check", async () => {
+    const device = await connect("Device A");
+    const old = await device.request(2, { v: U(1) });
+    assert.equal(num(old.code), 2, "a request on protocol 1 is unsupportedVersion");
+    assert.equal(num(old.v), 2);
+    const update = await device.request(16, { updcheck: true });
+    assert.equal(num(update.code), 0);
+    assert.equal(update.updstate, "unsupported");
+    assert.equal(update.appver, "1.6.0");
+    assert.match(update.err, /herdr/);
+    await device.close();
+  });
+
+  test("compresses what it sends a device that offers it, and nothing to one that does not", async () => {
+    for (const plain of [false, true]) {
+      const device = await connect("Device A", { plain });
+      const sid = num((await device.request(3, { cols: U(80), rows: U(24), cwdpath: os.tmpdir() })).sid);
+      await sleep(800);
+      device.send(6, { sid: U(sid), data: D("clear; for i in $(seq 1 400); do echo \"line $i of the history, padded to be worth packing\"; done; echo fin-$((2*3))\r") });
+      await device.waitForOutput(sid, "fin-6", 15000);
+      await sleep(1000);
+      device.send(5, { sid: U(sid) });
+      const attached = await device.request(4, { sid: U(sid) });
+      const terminal = new Terminal(num(attached.cols), num(attached.rows));
+      terminal.write("\x1b[H\x1b[2J");
+      terminal.write(bytes(attached.data));
+      const lines = terminal.allLines().filter((line) => /^line \d+ of/.test(line));
+      assert.equal(lines.length, 400, "the replay arrives whole");
+      const { received, wire } = await device.stats();
+      if (plain) assert.equal(wire, received, "nothing compressed for a device that did not offer it");
+      else assert.ok(wire < received / 2, `compressed: ${wire} bytes for ${received}`);
+      await device.request(8, { sid: U(sid) });
+      await device.close();
+    }
+  });
+
+  test("a connection past the handshake limit waits for a slot", async () => {
+    // Four connections that never send a byte hold every slot.
+    const stalled = await Promise.all(Array.from({ length: 4 }, () => new Promise((resolve) => {
+      const socket = net.connect(port, "127.0.0.1", () => resolve(socket));
+    })));
+    await sleep(200);
+    const waiting = connect("Device A");
+    await sleep(1000);
+    for (const socket of stalled) socket.destroy();
+    const device = await waiting;
+    assert.equal(device.refused, undefined);
+    assert.equal(num((await device.request(2)).code), 0);
+    await device.close();
   });
 
   test("opens a terminal, streams it, resizes it, and keeps its scrollback", async () => {

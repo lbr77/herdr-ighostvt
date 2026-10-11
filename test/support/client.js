@@ -12,7 +12,7 @@ export const D = (bytes) => ({ data: Buffer.from(bytes).toString("base64") });
 export const num = (value) => (value?.u64 !== undefined ? Number(value.u64) : value?.i64 !== undefined ? Number(value.i64) : undefined);
 export const bytes = (value) => (value?.data !== undefined ? Buffer.from(value.data, "base64") : Buffer.alloc(0));
 
-export function pair({ host = "127.0.0.1", port, hostID, code, deviceID, deviceName = "Interop iPhone", appVersion = "1.4.0" }) {
+export function pair({ host = "127.0.0.1", port, hostID, code, deviceID, deviceName = "Interop iPhone", appVersion = "1.6.0" }) {
   return new Promise((resolve, reject) => {
     execFile(CLIENT, ["pair", host, String(port), hostID, code, deviceID, deviceName, appVersion], { timeout: 20_000 }, (error, stdout) => {
       if (error && !stdout) return reject(error);
@@ -25,9 +25,11 @@ export function pair({ host = "127.0.0.1", port, hostID, code, deviceID, deviceN
 /// `events` collects events; `waitFor(predicate)` resolves with the first
 /// event (past or future) that matches.
 export class Device {
-  static connect({ host = "127.0.0.1", port, hostID, deviceID, key, appVersion = "1.4.0", deviceName = "Interop iPhone" }) {
+  /// `plain`: a hello that does not offer compression.
+  static connect({ host = "127.0.0.1", port, hostID, deviceID, key, appVersion = "1.6.0", deviceName = "Interop iPhone", plain = false }) {
     const device = new Device();
-    device.child = spawn(CLIENT, ["connect", host, String(port), hostID, deviceID, key, appVersion, deviceName]);
+    const env = plain ? { ...process.env, GHOSTVT_PLAIN: "1" } : process.env;
+    device.child = spawn(CLIENT, ["connect", host, String(port), hostID, deviceID, key, appVersion, deviceName], { env });
     return device.start();
   }
 
@@ -48,6 +50,7 @@ export class Device {
           if (line.kind === "ready") resolve(this);
           else if (line.kind === "refused") resolve(Object.assign(this, { refused: line }));
           else if (line.kind === "reply") this.replies.get(line.tag)?.(line.msg);
+          else if (line.kind === "stats") this.onStats?.(line);
           else if (line.kind === "event") {
             this.events.push(line.msg);
             this.check();
@@ -66,7 +69,16 @@ export class Device {
   }
 
   send(op, fields = {}, tag = 0) {
-    this.child.stdin.write(JSON.stringify({ tag, msg: { v: U(1), op: U(op), ...fields } }) + "\n");
+    this.child.stdin.write(JSON.stringify({ tag, msg: { v: U(2), op: U(op), ...fields } }) + "\n");
+  }
+
+  /// Frame bytes received so far: `received` as decoded, `wire` as they
+  /// crossed the network.
+  stats() {
+    return new Promise((resolve) => {
+      this.onStats = resolve;
+      this.child.stdin.write(JSON.stringify({ stats: true }) + "\n");
+    });
   }
 
   request(op, fields = {}, timeoutMs = 15_000) {

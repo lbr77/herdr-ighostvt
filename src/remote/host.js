@@ -10,7 +10,8 @@ import { RemoteClient } from "./client.js";
 import { Pairing } from "./pairing.js";
 import { Uploads } from "./uploads.js";
 import {
-  DEFAULT_APP_VERSION, DEFAULT_PORT, MAXIMUM_UNAUTHENTICATED_CONNECTIONS, PAIRING_IDENTITY, PAIRING_KEY, wireSpelling,
+  DEFAULT_APP_VERSION, DEFAULT_PORT, HANDSHAKE_TIMEOUT_MS, MAXIMUM_UNAUTHENTICATED_CONNECTIONS,
+  MAXIMUM_WAITING_CONNECTIONS, PAIRING_IDENTITY, PAIRING_KEY, wireSpelling,
 } from "./protocol.js";
 
 /// TLS 1.2 with TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 (0xCCAC), as the
@@ -51,6 +52,9 @@ export class RemoteHost extends EventEmitter {
     this.pairing = new Pairing({ store, log });
     this.uploads = new Uploads();
     this.clients = new Set();
+    this.pending = new Set();
+    /// Accepted past the handshake limit, not started yet, oldest first.
+    this.waiting = [];
     this.port = null;
     this.pairing.on("closePairingClients", () => {
       for (const client of this.clients) if (client.mode === "pairing") client.close("pairing closed");
@@ -133,33 +137,68 @@ export class RemoteHost extends EventEmitter {
       socket.destroy();
       return;
     }
-    const unauthenticated = [...this.pendingSockets()].filter((pending) => pending.viaRelay === viaRelay).length;
-    if (unauthenticated >= MAXIMUM_UNAUTHENTICATED_CONNECTIONS) {
+    socket.setKeepAlive(true, 10_000);
+    if (this.hasHandshakeSlot(viaRelay)) return this.start(socket, viaRelay, description);
+    // A window of tabs comes back at once — a launch, the app returning to
+    // the foreground, the network coming back — so past the limit a
+    // connection waits for a slot instead of being refused.
+    if (this.waiting.filter((waiting) => waiting.viaRelay === viaRelay).length >= MAXIMUM_WAITING_CONNECTIONS) {
       this.log(`refused ${description}: too many connections still handshaking`);
       socket.destroy();
       return;
     }
-    socket.setKeepAlive(true, 10_000);
+    const waiting = { socket, viaRelay, address: description };
+    const leave = () => {
+      clearTimeout(waiting.timer);
+      this.waiting = this.waiting.filter((other) => other !== waiting);
+    };
+    waiting.timer = setTimeout(() => {
+      leave();
+      this.log(`refused ${description}: waited ${HANDSHAKE_TIMEOUT_MS / 1000} s for a handshake slot`);
+      socket.destroy();
+    }, HANDSHAKE_TIMEOUT_MS);
+    waiting.leave = leave;
+    socket.once("close", leave);
+    this.waiting.push(waiting);
+  }
+
+  start(socket, viaRelay, description) {
     const pending = { socket, viaRelay, address: description, client: null };
-    this.pending ??= new Set();
     this.pending.add(pending);
-    socket.once("close", () => this.pending.delete(pending));
+    socket.once("close", () => {
+      this.pending.delete(pending);
+      this.handshakeEnded();
+    });
     socket.ghostvtPending = pending;
     (viaRelay ? this.relayed : this.direct).emit("connection", socket);
   }
 
-  *pendingSockets() {
-    for (const pending of this.pending ?? []) {
-      if (!pending.client || !pending.client.authenticated) yield pending;
+  hasHandshakeSlot(viaRelay) {
+    let count = 0;
+    for (const pending of this.pending) {
+      if (pending.viaRelay === viaRelay && !pending.client?.authenticated) count += 1;
+    }
+    return count < MAXIMUM_UNAUTHENTICATED_CONNECTIONS;
+  }
+
+  /// A handshake slot came free: a client proved itself, or left.
+  handshakeEnded() {
+    for (const waiting of [...this.waiting]) {
+      if (!this.hasHandshakeSlot(waiting.viaRelay)) continue;
+      waiting.leave();
+      waiting.socket.removeListener("close", waiting.leave);
+      if (!waiting.socket.destroyed) this.start(waiting.socket, waiting.viaRelay, waiting.address);
     }
   }
 
   clientAuthenticated() {
+    this.handshakeEnded();
     this.emit("changed");
   }
 
   clientClosed(client) {
     this.clients.delete(client);
+    this.handshakeEnded();
     this.emit("changed");
   }
 
@@ -170,6 +209,10 @@ export class RemoteHost extends EventEmitter {
 
   close() {
     this.listener?.close();
+    for (const waiting of [...this.waiting]) {
+      waiting.leave();
+      waiting.socket.destroy();
+    }
     for (const client of this.clients) client.close("bridge stopping");
   }
 }

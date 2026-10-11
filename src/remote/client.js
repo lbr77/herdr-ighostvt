@@ -4,13 +4,17 @@
 // speaks the session protocol, answered here against herdr.
 
 import crypto from "node:crypto";
-import { FrameReader, KIND, encodeFrame, MAXIMUM_PAYLOAD_BYTES } from "../wire/frame.js";
+import {
+  COMPRESSION_MINIMUM_BYTES, FrameReader, HEADER_BYTES, KIND, MAXIMUM_PAYLOAD_BYTES, compressedFrame, encodePayload,
+  plainFrame,
+} from "../wire/frame.js";
 import * as xpc from "../wire/xpc.js";
 import {
-  CODE, EVENT, EXPORTER_BYTES, EXPORTER_LABEL, HANDSHAKE_TIMEOUT_MS, MAXIMUM_MESSAGE_DATA_BYTES,
-  MAXIMUM_SESSION_ATTRIBUTE_BYTES, MAXIMUM_SESSION_ATTRIBUTE_COUNT, MAXIMUM_SESSIONS_PER_PEER,
-  MAXIMUM_UNAUTHENTICATED_PAYLOAD_BYTES, OP, PAIRING_FINISH_MS, PAIRING_IDENTITY, PROTOCOL_VERSION,
-  RELAYED_SILENCE_LIMIT_MS, UPLOAD_CHUNK_BYTES, isCompatible, isValidDeviceID, lineDescription, sanitizedName,
+  CODE, COMPRESSION_ALGORITHM, DEVICE_SILENCE_LIMIT_MS, EVENT, EXPORTER_BYTES, EXPORTER_LABEL, HANDSHAKE_TIMEOUT_MS,
+  LINK_RECEIPT_BYTES, LINK_WINDOW_BYTES, MAXIMUM_MESSAGE_DATA_BYTES, MAXIMUM_SESSION_ATTRIBUTE_BYTES,
+  MAXIMUM_SESSION_ATTRIBUTE_COUNT, MAXIMUM_SESSIONS_PER_PEER, MAXIMUM_UNAUTHENTICATED_PAYLOAD_BYTES, OP,
+  PAIRING_FINISH_MS, PAIRING_IDENTITY, PROTOCOL_VERSION, UPLOAD_CHUNK_BYTES, isCompatible, isValidDeviceID,
+  lineDescription, sanitizedName,
 } from "./protocol.js";
 import { REFUSAL } from "./pairing.js";
 import { SessionError } from "../herdr/sessions.js";
@@ -18,9 +22,20 @@ import { UploadError } from "./uploads.js";
 
 const { u64, i64 } = xpc;
 /// Output toward a device that is not being taken by the network is held
-/// in herdr instead of here: above this much, its streams pause.
+/// in herdr instead of here: above this much, or past the link window, its
+/// streams pause.
 const PAUSE_ABOVE_BYTES = 1 << 20;
+const RESUME_BELOW_BYTES = 256 * 1024;
+/// Past either of these, frames for the device are skipped and a repaint
+/// sent once it has caught up. In flight is known only to within a receipt
+/// (the device reports every `LINK_RECEIPT_BYTES`), so its threshold must
+/// stay above one: a device that has received everything reports again.
 const CONGESTED_BYTES = 64 * 1024;
+const CONGESTED_IN_FLIGHT_BYTES = LINK_WINDOW_BYTES / 2;
+/// A frame of this much that would not pack sends the next ones plain: a
+/// stream that does not compress is not tried frame by frame.
+const COMPRESSION_MISS_BYTES = 8 * 1024;
+const PLAIN_FRAMES_AFTER_MISS = 32;
 
 export class RemoteClient {
   constructor({ socket, address, viaRelay, host }) {
@@ -37,7 +52,13 @@ export class RemoteClient {
     this.paused = false;
     this.queue = Promise.resolve();
     this.lastHeard = Date.now();
-    this.lastSent = Date.now();
+    /// Frame bytes sent, each counted as its plain self, compressed or
+    /// not; and what the device last said it received of them — null for
+    /// a device that does not report.
+    this.sentBytes = 0;
+    this.deviceReceived = null;
+    this.compressesOutput = false;
+    this.plainFramesAfterMiss = 0;
   }
 
   get authenticated() {
@@ -48,7 +69,7 @@ export class RemoteClient {
     this.socket.on("data", (chunk) => this.received(chunk));
     this.socket.on("close", () => this.closedByNetwork("closed"));
     this.socket.on("error", (error) => this.closedByNetwork(error.message));
-    this.socket.on("drain", () => this.resume());
+    this.socket.on("drain", () => this.updatePause());
     this.socket.setNoDelay?.(true);
     this.handshakeTimer = setTimeout(() => {
       if (this.mode === "handshaking") this.close(`no first frame in ${HANDSHAKE_TIMEOUT_MS / 1000} s`);
@@ -83,32 +104,63 @@ export class RemoteClient {
 
   send(kind, tag, object) {
     if (this.closed || this.socket.destroyed) return false;
-    let frame;
+    let payload;
     try {
-      frame = encodeFrame(kind, tag, object);
+      payload = encodePayload(object);
     } catch (error) {
       this.log(`could not encode a frame: ${error.message}`);
       return false;
     }
-    this.socket.write(frame);
-    this.lastSent = Date.now();
-    if (!this.paused && this.socket.writableLength > PAUSE_ABOVE_BYTES) {
-      this.paused = true;
-      this.host.sessions.setPaused?.(this, true);
+    let frame = null;
+    if (this.compressesOutput && payload.length >= COMPRESSION_MINIMUM_BYTES) {
+      if (this.plainFramesAfterMiss > 0) {
+        this.plainFramesAfterMiss -= 1;
+      } else {
+        frame = compressedFrame(kind, tag, payload);
+        // One small frame of escapes that will not pack says little about
+        // the stream; a large one does.
+        if (!frame && payload.length >= COMPRESSION_MISS_BYTES) this.plainFramesAfterMiss = PLAIN_FRAMES_AFTER_MISS;
+      }
     }
+    this.socket.write(frame ?? plainFrame(kind, tag, payload));
+    this.sentBytes += HEADER_BYTES + payload.length;
+    this.updatePause();
     return true;
+  }
+
+  /// Output the device has not said it received: everything the path
+  /// holds, which `writableLength` (what the kernel has not taken) cannot
+  /// see. A receipt is never ahead of what was sent; compare, never trust.
+  inFlight() {
+    if (this.deviceReceived === null) return 0;
+    return Math.max(0, this.sentBytes - this.deviceReceived);
   }
 
   /// Output waiting to go out: frames for this device are then skipped
   /// and a repaint sent when it has caught up.
   congested() {
-    return this.socket.writableLength > CONGESTED_BYTES;
+    return this.socket.writableLength > CONGESTED_BYTES || this.inFlight() > CONGESTED_IN_FLIGHT_BYTES;
   }
 
-  resume() {
-    if (!this.paused) return;
-    this.paused = false;
-    this.host.sessions.setPaused?.(this, false);
+  updatePause() {
+    if (this.closed) return;
+    const pending = this.socket.writableLength;
+    const inFlight = this.inFlight();
+    if (!this.paused && (pending > PAUSE_ABOVE_BYTES || inFlight > LINK_WINDOW_BYTES)) {
+      this.paused = true;
+      this.host.sessions.setPaused?.(this, true);
+    } else if (this.paused && pending < RESUME_BELOW_BYTES && inFlight < LINK_WINDOW_BYTES - LINK_RECEIPT_BYTES) {
+      this.paused = false;
+      this.host.sessions.setPaused?.(this, false);
+    }
+  }
+
+  /// Records a `rcvd` the device sent, if it sent one.
+  noteReceived(message) {
+    const received = xpc.getNumber(message, "rcvd");
+    if (received === undefined) return;
+    this.deviceReceived = received;
+    this.updatePause();
   }
 
   reply(tag, code, fields = {}) {
@@ -184,8 +236,9 @@ export class RemoteClient {
   isSameVersion(message, tag) {
     const theirs = xpc.getString(message, "appver");
     const ours = this.host.appVersion;
-    if (isCompatible(theirs, ours)) return true;
-    this.log(`refused: it runs iGhostVT ${theirs ?? "older than 1.4"}, this host speaks ${ours}`);
+    const protocol = xpc.getU64(message, "v");
+    if (isCompatible(theirs, ours) && protocol === PROTOCOL_VERSION) return true;
+    this.log(`refused: it runs iGhostVT ${theirs ?? "older than 1.4"} (protocol ${protocol ?? "?"}), this host speaks ${ours} (protocol ${PROTOCOL_VERSION})`);
     this.reply(tag, CODE.unsupportedVersion, {
       appver: this.host.wireVersion,
       err: `The other device runs iGhostVT ${lineDescription(ours)}. Update both devices to the same version to connect.`,
@@ -216,17 +269,24 @@ export class RemoteClient {
     this.mode = "session";
     this.deviceID = deviceID;
     this.reader.maximumPayloadBytes = MAXIMUM_PAYLOAD_BYTES;
+    // A device that will report what it receives says so in its hello, so
+    // the window holds from the first byte.
+    this.noteReceived(hello);
+    // Only past the proof: nothing is compressed for a peer that has not
+    // shown it holds a key. The hello's reply is the first that may be.
+    this.compressesOutput = xpc.getU64(hello, "cmpr") === COMPRESSION_ALGORITHM;
     this.host.store.markSeen(deviceID, xpc.getString(hello, "devname"));
     this.name = this.host.store.device(deviceID).name;
     this.host.clientAuthenticated(this);
-    this.log(`device ${this.name} (${deviceID}) connected`);
-    if (this.viaRelay) {
-      this.silenceTimer = setInterval(() => {
-        if (isGone({ now: Date.now(), lastHeard: this.lastHeard, lastSent: this.lastSent })) {
-          this.close(`nothing from the device in ${RELAYED_SILENCE_LIMIT_MS / 1000} s`);
-        }
-      }, RELAYED_SILENCE_LIMIT_MS / 3);
-    }
+    this.log(`device ${this.name} (${deviceID}) connected${this.compressesOutput ? ", compressed" : ""}`);
+    // A link can look alive at every TCP hop and be dead end to end — a
+    // relay leg, a NAT, a phone gone to sleep; the device pings a quiet
+    // link, so silence means it is gone.
+    this.silenceTimer = setInterval(() => {
+      if (Date.now() - this.lastHeard > DEVICE_SILENCE_LIMIT_MS) {
+        this.close(`nothing from the device in ${DEVICE_SILENCE_LIMIT_MS / 1000} s`);
+      }
+    }, DEVICE_SILENCE_LIMIT_MS / 3);
     this.reply(tag, CODE.success);
   }
 
@@ -271,9 +331,16 @@ export class RemoteClient {
   async session(message, tag, op) {
     const sessions = this.host.sessions;
     const sid = xpc.getNumber(message, "sid");
+    if (op === OP.ping) {
+      // Answered whatever its version: a receipt (tag 0) wants no reply.
+      this.noteReceived(message);
+      return this.reply(tag, CODE.success);
+    }
+    if (xpc.getU64(message, "v") !== PROTOCOL_VERSION) {
+      return this.reply(tag, CODE.unsupportedVersion, { appver: this.host.wireVersion });
+    }
     try {
       switch (op) {
-        case OP.ping:
         case OP.hello:
           return this.reply(tag, CODE.success);
         case OP.goodbye:
@@ -334,6 +401,14 @@ export class RemoteClient {
         }
         case OP.uploadFile:
           return this.upload(message, tag);
+        case OP.hostUpdate:
+          // A device's Check for Update: this host is herdr's plugin, and
+          // updates with it.
+          return this.reply(tag, CODE.success, {
+            updstate: "unsupported",
+            appver: this.host.wireVersion,
+            err: "This host is herdr's iGhostVT plugin. Update it on the computer, with herdr.",
+          });
         default:
           return this.reply(tag, CODE.invalidRequest);
       }
@@ -380,19 +455,6 @@ export class RemoteClient {
     return this.reply(tag, CODE.success, { off: u64(uploads.received(id)) });
   }
 }
-
-/// Whether a relayed device is gone. The app pings only a link it has not
-/// heard from the host on for 15 s, so silence means something only once
-/// this side has been quiet long enough for a ping to be due: a device
-/// watching a busy terminal sends nothing, and is alive. While output flows
-/// a dead device is the relay's to notice — it closes both legs when one
-/// stops acknowledging.
-export function isGone({ now, lastHeard, lastSent }) {
-  return now - lastHeard > RELAYED_SILENCE_LIMIT_MS && now - lastSent > PING_DUE_MS;
-}
-
-/// The app's ping interval (15 s) and the 5 s it checks at, with margin.
-const PING_DUE_MS = 30_000;
 
 /// The foreground process as every open/attach reply and event 102 state it.
 function foreground({ proc, fgshell, cwd, cwddisp }) {
