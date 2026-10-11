@@ -1,6 +1,6 @@
 id = "ghostvt"
 name = "iGhostVT bridge"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
 description = "Open herdr terminals from iGhostVT on iPhone, iPad and Mac, on the local network or through an iGhostVT relay"
 platforms = ["macos", "linux"]

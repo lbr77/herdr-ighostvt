@@ -1,6 +1,6 @@
 {
   "name": "herdr-ghostvt",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "herdr plugin: an iGhostVT host whose terminals are herdr's",
   "license": "MIT",
