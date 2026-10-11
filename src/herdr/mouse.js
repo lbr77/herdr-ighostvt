@@ -9,9 +9,11 @@
 // older ones have no such command and the click is dropped here).
 
 /// Mouse reporting on or off in the device's terminal: clicks and the
-/// wheel (1000), SGR encoding (1006).
-export const MOUSE_ON = Buffer.from("\x1b[?1000h\x1b[?1006h");
-export const MOUSE_OFF = Buffer.from("\x1b[?1000l\x1b[?1006l");
+/// wheel (1000), drags with a button held (1002), SGR encoding (1006). A
+/// finger's pan is still the wheel in 1002 — only a pointer drags — and
+/// Shift with a drag still selects on the device.
+export const MOUSE_ON = Buffer.from("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+export const MOUSE_OFF = Buffer.from("\x1b[?1000l\x1b[?1002l\x1b[?1006l");
 
 const SGR_MOUSE = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
 /// The start of an SGR mouse report cut off at the end of a write.

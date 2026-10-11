@@ -324,7 +324,7 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     const log = path.join(work, "fullscreen.log");
     const mark = device.output(sid).length;
     device.send(6, { sid: U(sid), data: D(`node ${path.join(ROOT, "test/support/fullscreen.js")} ${log}\r`) });
-    await device.waitFor(() => device.output(sid).slice(mark).includes("\x1b[?1000h\x1b[?1006h"), 8000);
+    await device.waitFor(() => device.output(sid).slice(mark).includes("\x1b[?1000h\x1b[?1002h\x1b[?1006h"), 8000);
     assert.ok(!device.output(sid).slice(mark).includes("\x1b[3J"), "the device's scrollback is not cleared for it");
 
     device.send(6, { sid: U(sid), data: D("\x1b[<64;10;5M\x1b[<65;10;5M") });
@@ -352,7 +352,7 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
 
     const after = device.output(sid).length;
     device.send(6, { sid: U(sid), data: D("q") });
-    await device.waitFor(() => device.output(sid).slice(after).includes("\x1b[?1000l\x1b[?1006l"), 8000);
+    await device.waitFor(() => device.output(sid).slice(after).includes("\x1b[?1000l\x1b[?1002l\x1b[?1006l"), 8000);
     device.send(6, { sid: U(sid), data: D("\x1b[<64;10;5M") });
     const scrolled = await waitUntil(async () => (await request("pane.get", { pane_id: paneID })).pane.scroll.offset_from_bottom > 0, 5000, "herdr's own scrolling");
     assert.ok(scrolled);

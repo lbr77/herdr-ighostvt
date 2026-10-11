@@ -134,9 +134,10 @@ Known differences from a terminal on an iGhostVT host:
   in herdr's own window: as wheel events for a program that reads the mouse,
   as arrow keys for one that does not. A fling is paced to the program's
   drawing (a few steps queued at most, dropped when the swipe turns), so the
-  view stops when the finger does. Taps reach it on herdr 0.9.2 and
-  later; on older herdr they are dropped. Raw mouse reports never go to a
-  program as typed input. Selecting text still works there: on iPhone and
+  view stops when the finger does. Clicks, and drags with a pointer (a
+  mouse or trackpad: Claude Code's own selection), reach it on herdr 0.9.2
+  and later; on older herdr they are dropped. Raw mouse reports never go to
+  a program as typed input. Selecting text still works there: on iPhone and
   iPad a double tap selects a word, a triple tap a row, and the handles
   extend it; in the Mac app, Shift-drag. A shell without history yet (new,
   or just cleared) is not treated as full-screen.
@@ -155,7 +156,7 @@ In the plugin's state directory (`~/.local/state/herdr/plugins/ghostvt`):
 |---|---|
 | `state.json` | The host id, the paired devices and their keys, the relay host key (mode 0600) |
 | `sessions.json` | Which herdr terminals are which iGhostVT sessions |
-| `daemon.log` | The bridge's log |
+| `daemon.log` | The bridge's log. Started with `GHOSTVT_TRACE_INPUT=1` (`GHOSTVT_TRACE_INPUT=1 node src/cli.js start`), the bridge also logs each write from a device with its text as dots, to see which keys and mouse reports arrive |
 | `ctl.sock` | How the actions and `src/cli.js` reach the bridge |
 
 The relay configuration is kept as `relay.vtrpsc` in the config directory.

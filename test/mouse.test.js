@@ -24,6 +24,16 @@ test("clicks go to herdr only where it can take them, and are dropped otherwise"
   ]);
 });
 
+test("a drag goes to herdr as one, down, drags and up", () => {
+  const drag = Buffer.from("\x1b[<0;11;5M\x1b[<32;12;5M\x1b[<32;20;7M\x1b[<0;20;7m");
+  assert.deepEqual(splitMouse(drag, "", { clicks: true }).commands, [
+    { type: "terminal.mouse", action: "down", button: "left", column: 10, row: 4 },
+    { type: "terminal.mouse", action: "drag", button: "left", column: 11, row: 4 },
+    { type: "terminal.mouse", action: "drag", button: "left", column: 19, row: 6 },
+    { type: "terminal.mouse", action: "up", button: "left", column: 19, row: 6 },
+  ]);
+});
+
 test("a report cut off between writes is put back together", () => {
   const first = splitMouse(Buffer.from("x\x1b[<64;1"));
   assert.equal(first.input.toString(), "x");

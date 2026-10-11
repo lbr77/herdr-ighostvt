@@ -410,6 +410,7 @@ export class RemoteClient {
             err: "This host is herdr's iGhostVT plugin. Update it on the computer, with herdr.",
           });
         default:
+          if (process.env.GHOSTVT_TRACE_INPUT) this.log(`unhandled op ${op}`);
           return this.reply(tag, CODE.invalidRequest);
       }
     } catch (error) {

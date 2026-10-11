@@ -298,8 +298,12 @@ export class SessionRegistry extends EventEmitter {
     if (!session.paneID) return false;
     try {
       const info = await herdr.processInfo(session.paneID);
-      const foreground = info.foreground_processes?.[0];
-      const proc = foreground?.name || session.proc;
+      // The group's leader: what was run. Its children share the group and
+      // can be listed first (Claude Code's `caffeinate`), and its own name
+      // can be its binary's (`2.1.296`); argv[0] is what was typed.
+      const processes = info.foreground_processes ?? [];
+      const foreground = processes.find((entry) => entry.pid === info.foreground_process_group_id) ?? processes[0];
+      const proc = (foreground?.argv0 && path.basename(foreground.argv0)) || foreground?.name || session.proc;
       const fgShell = info.foreground_process_group_id === info.shell_pid
         || SHELLS.has(proc.replace(/^-/, ""));
       const cwd = foreground?.cwd || session.cwd;
@@ -423,11 +427,17 @@ export class SessionRegistry extends EventEmitter {
       old.removeAllListeners("frame");
       takeover = true;
     }
+    // The bridge's own controller, let go moments ago, is still attached
+    // until its process ends: herdr would call the terminal busy. It is
+    // taken over instead, and the size it is putting back is the pane's.
+    const releasing = session.releasing;
+    session.releasing = null;
+    if (releasing) takeover = true;
     clearTimeout(session.lingerTimer);
     session.lingerTimer = null;
     if (!old && session.paneID) {
       // What the pane is now, before the device's size replaces it.
-      session.naturalSize = await paneSize(session.paneID);
+      session.naturalSize = releasing ? releasing.naturalSize : await paneSize(session.paneID);
     }
     const controller = new Controller(session.terminalID, { cols, rows, takeover });
     session.controller = controller;
@@ -776,11 +786,19 @@ export class SessionRegistry extends EventEmitter {
     session.holder = null;
     session.gate = null;
     if (session.controller) {
-      session.controller.removeAllListeners("closed");
+      const controller = session.controller;
+      controller.removeAllListeners("closed");
       // herdr leaves a terminal at the last controller's size; the pane
       // goes back to the size it had, for whoever looks at it in herdr.
-      session.controller.release(session.naturalSize);
+      controller.release(session.naturalSize);
       session.controller = null;
+      if (controller.child.exitCode === null) {
+        const releasing = { naturalSize: session.naturalSize };
+        session.releasing = releasing;
+        controller.child.once("close", () => {
+          if (session.releasing === releasing) session.releasing = null;
+        });
+      }
     }
     session.naturalSize = null;
   }
@@ -795,6 +813,9 @@ export class SessionRegistry extends EventEmitter {
     if (!session) throw new SessionError(CODE.unknownSession);
     if (session.controller.child.stdin.writableLength > 4 << 20) throw new SessionError(CODE.inputBacklog);
     const { input, commands, pending } = splitMouse(data, session.mousePending, { clicks: this.clicks });
+    if (process.env.GHOSTVT_TRACE_INPUT) {
+      this.log(`input ${sid}: ${traceBytes(data)} → program ${traceBytes(input)}, ${commands.length} mouse${pending ? `, holding ${traceBytes(Buffer.from(pending, "latin1"))}` : ""}`);
+    }
     session.mousePending = pending;
     for (const command of commands) {
       if (command.type === "terminal.scroll") this.wheel(session, command.direction);
@@ -914,6 +935,31 @@ function isDirectory(directory) {
   } catch {
     return false;
   }
+}
+
+/// Input as GHOSTVT_TRACE_INPUT logs it: escape sequences and control bytes
+/// as they are, text as dots, so what was typed stays out of the log.
+function traceBytes(bytes) {
+  const text = bytes.toString("latin1");
+  let out = "";
+  let inSequence = false;
+  for (const character of text) {
+    const code = character.charCodeAt(0);
+    if (code === 0x1b) {
+      out += "ESC";
+      inSequence = true;
+    } else if (code < 0x20 || code === 0x7f) {
+      out += `^${String.fromCharCode(code ^ 0x40)}`;
+      inSequence = false;
+    } else if (inSequence && code < 0x80) {
+      out += character;
+      // A CSI ends at its final byte; ESC + one character is a whole one.
+      if (!(character === "[" || character === "]" || character === "O") && (code >= 0x40 || !out.match(/ESC[\[\]O]/))) inSequence = false;
+    } else {
+      out += ".";
+    }
+  }
+  return `[${bytes.length}] ${out || "(nothing)"}`;
 }
 
 /// OSC 2 with the pane's title, for the device's tab; nothing without one.
