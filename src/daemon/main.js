@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { herdr } from "../herdr/api.js";
+import { Pasteboard } from "../herdr/pasteboard.js";
 import { SessionRegistry } from "../herdr/sessions.js";
 import { RemoteHost } from "../remote/host.js";
 import { Advertisement } from "../remote/mdns.js";
@@ -90,6 +91,7 @@ async function main() {
     workspaceLabel: config.workspace || "iGhostVT",
     expose: config.expose,
     clicks: atLeast(pong.version, [0, 9, 2]),
+    pasteboard: config.clipboard === false ? null : new Pasteboard({ log }),
     log,
   });
   await sessions.start();

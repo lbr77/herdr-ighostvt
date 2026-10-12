@@ -28,6 +28,9 @@ const skip = process.platform !== "darwin" ? "macOS only"
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const SESSION = `ghostvt-test-${process.pid}`;
 const SOCKET = path.join(os.homedir(), ".config", "herdr", "sessions", SESSION, "herdr.sock");
+/// The bridge watches this pasteboard instead of the clipboard.
+const PASTEBOARD = `ghostvt-test-${process.pid}`;
+const COPY = path.join(ROOT, "test/support/copy.js");
 
 let work;
 let server;
@@ -85,6 +88,7 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
       HERDR_SOCKET_PATH: SOCKET,
       HERDR_PLUGIN_STATE_DIR: path.join(work, "state"),
       HERDR_PLUGIN_CONFIG_DIR: path.join(work, "config"),
+      GHOSTVT_PASTEBOARD: PASTEBOARD,
     });
     server = spawn("herdr", ["--session", SESSION, "server"], { stdio: "ignore" });
     await waitUntil(() => fs.existsSync(SOCKET) && spawnSync("herdr", ["--session", SESSION, "status", "server"]).stdout.includes("running"), 15_000, "herdr");
@@ -99,6 +103,7 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     daemon?.kill();
     spawnSync("herdr", ["--session", SESSION, "server", "stop"]);
     server?.kill();
+    spawnSync(process.execPath, [COPY, PASTEBOARD]);
     await sleep(500);
     fs.rmSync(path.dirname(SOCKET), { recursive: true, force: true });
     fs.rmSync(work, { recursive: true, force: true });
@@ -298,6 +303,23 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     const panes = await request("pane.list", {});
     assert.ok(panes.panes.some((pane) => pane.pane_id === paneID), "closing the tab on the device leaves a pane it did not make");
     assert.ok((await device.request(2)).sessions.some((entry) => num(entry.sid) === sid));
+    await device.close();
+  });
+
+  test("a copy made right after the device's input goes to the device", async () => {
+    const osc52 = (text) => `\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`;
+    const device = await connect("Device A");
+    const sid = num((await device.request(3, { cols: U(60), rows: U(12), cwdpath: os.tmpdir() })).sid);
+    await sleep(800);
+    // The program copies, the way Claude Code's Ctrl+C runs `pbcopy`.
+    device.send(6, { sid: U(sid), data: D(`node ${COPY} ${PASTEBOARD} 'copied 剪贴板'\r`) });
+    await device.waitForOutput(sid, osc52("copied 剪贴板"));
+    // Copied on the Mac a while after the device's last input: it stays there.
+    await sleep(3500);
+    assert.equal(spawnSync(process.execPath, [COPY, PASTEBOARD, "the Mac's own"]).status, 0);
+    await sleep(1500);
+    assert.ok(!device.output(sid).includes(osc52("the Mac's own")), "a copy on the Mac is not the device's");
+    await device.request(8, { sid: U(sid) });
     await device.close();
   });
 

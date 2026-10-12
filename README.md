@@ -97,6 +97,7 @@ Optional, in the plugin's config directory (`herdr plugin config-dir ghostvt`),
 | `appVersion` | The iGhostVT release line to speak; only 1.6 is implemented, so remove an older value | `1.6.0` |
 | `bonjour` | `false` to not advertise on the local network | `true` |
 | `autoUpdate` | `false` to not install new releases on its own | `true` |
+| `clipboard` | `false` to leave copies made in a pane on the Mac (see below) | `true` |
 
 iGhostVT's own host on the same Mac holds port 46404; the bridge then takes
 the next free one and advertises it. Devices that find the host over Bonjour
@@ -142,8 +143,16 @@ Known differences from a terminal on an iGhostVT host:
   iPad a double tap selects a word, a triple tap a row, and the handles
   extend it; in the Mac app, Shift-drag. A shell without history yet (new,
   or just cleared) is not treated as full-screen.
-- The bell and OSC 52 clipboard writes do not reach the device. The pane's
-  title does: the bridge passes herdr's on.
+- The bell does not reach the device, nor does a program's OSC 52 copy as
+  such: herdr hands it to its own window, never to a terminal stream. A copy
+  still reaches the device's clipboard when it lands on the Mac's within 3
+  seconds of the device's input to the session. Claude Code's Ctrl+C on its
+  selection, and its `/copy`, run `pbcopy`; another program's OSC 52 lands
+  there while herdr's own window is open on the Mac. The bridge watches the
+  Mac's clipboard (an `osascript`) only while a device holds a session, and
+  a copy made on the Mac otherwise stays there; `clipboard: false` turns
+  this off. The pane's title does reach the device: the bridge passes
+  herdr's on.
 - A session is shown at one size at a time: the device holding it sets the
   pane's size in herdr while it is attached.
 - The bridge serves one herdr server: the default session, or the one named

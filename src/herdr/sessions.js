@@ -44,6 +44,10 @@ const FRAME_INTERVAL_MS = 33;
 /// step that draws nothing (the program is at its end) holds the next.
 const WHEEL_BACKLOG = 3;
 const WHEEL_WAIT_MS = 150;
+/// A change to the Mac's clipboard this soon after a device's input is taken
+/// as that device's copy; a larger copy than this is not sent.
+const COPY_WINDOW_MS = 3000;
+const COPY_BYTES = 256 * 1024;
 const SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "elvish", "xonsh", "pwsh", "login"]);
 
 export class SessionError extends Error {
@@ -86,6 +90,8 @@ class Session {
     /// program runs), and a mouse report cut off between two writes.
     this.mouse = null;
     this.mousePending = "";
+    /// When the holder's input last came: a copy right after it is its own.
+    this.inputAt = 0;
     this.proc = path.basename(process.env.SHELL || "zsh");
     this.fgShell = true;
     this.cwd = undefined;
@@ -111,10 +117,14 @@ class Session {
 }
 
 export class SessionRegistry extends EventEmitter {
-  constructor({ stateDir, workspaceLabel = "iGhostVT", expose = "all", clicks = false, log = () => {} }) {
+  constructor({ stateDir, workspaceLabel = "iGhostVT", expose = "all", clicks = false, pasteboard = null, log = () => {} }) {
     super();
     /// herdr takes `terminal.mouse` (0.9.2 and later).
     this.clicks = clicks;
+    /// The Mac's clipboard (pasteboard.js), watched while a session is held;
+    /// null to leave copies where they land.
+    this.pasteboard = pasteboard;
+    pasteboard?.on("change", () => this.copied());
     this.file = path.join(stateDir, "sessions.json");
     this.workspaceLabel = workspaceLabel;
     this.exposeAll = expose !== "workspace";
@@ -154,6 +164,7 @@ export class SessionRegistry extends EventEmitter {
     this.events?.stop();
     clearInterval(this.poller);
     for (const session of this.sessions.values()) this.letGo(session);
+    this.pasteboard?.stop();
   }
 
   save() {
@@ -318,6 +329,8 @@ export class SessionRegistry extends EventEmitter {
   }
 
   async pollProcesses() {
+    // Nothing held: no copy can be a device's.
+    if (![...this.sessions.values()].some((session) => session.holder)) this.pasteboard?.stop();
     for (const session of this.sessions.values()) {
       if (!session.holder || session.holder.peer.closed) continue;
       if (await this.refreshProcess(session)) {
@@ -487,6 +500,7 @@ export class SessionRegistry extends EventEmitter {
     if (old) old.close("replaced");
     session.holder = { peer, name: peer.name, deviceID: peer.deviceID };
     session.awaitingFull = false;
+    this.pasteboard?.start();
     // The connection may have gone while herdr was getting ready; it then
     // holds the terminal as any connection that dropped does.
     if (peer.closed) this.linger(session, peer);
@@ -729,6 +743,37 @@ export class SessionRegistry extends EventEmitter {
     return recentLines.slice(Math.max(0, above - count), above);
   }
 
+  // MARK: - Copying
+  //
+  // A copy made in a pane lands on this Mac's clipboard (pasteboard.js). One
+  // that comes right after a device's input to a session — Ctrl+C on Claude
+  // Code's selection, its `/copy` — is taken as that device's, and goes to
+  // it as OSC 52, which puts it on the device's clipboard. A copy made on the
+  // Mac otherwise stays there, unread.
+
+  async copied() {
+    const now = Date.now();
+    let target = null;
+    for (const session of this.sessions.values()) {
+      if (!session.holder || session.holder.peer.closed || session.gate || now - session.inputAt > COPY_WINDOW_MS) continue;
+      if (!target || session.inputAt > target.inputAt) target = session;
+    }
+    if (!target) return;
+    const holder = target.holder;
+    const text = await this.pasteboard.read();
+    if (!text || target.holder !== holder) return;
+    // herdr's own window, when it is open, copies the same OSC 52 again.
+    if (this.lastCopy?.text === text && Date.now() - this.lastCopy.at < COPY_WINDOW_MS) return;
+    this.lastCopy = { text, at: Date.now() };
+    const bytes = Buffer.from(text, "utf8");
+    if (bytes.length > COPY_BYTES) {
+      this.log(`session ${target.sid}: a copy of ${bytes.length} bytes is too large for the device`);
+      return;
+    }
+    this.log(`session ${target.sid}: a copy of ${bytes.length} bytes goes to ${target.holder.name}`);
+    this.send(target, Buffer.from(`\x1b]52;c;${bytes.toString("base64")}\x07`));
+  }
+
   send(session, bytes) {
     const peer = session.holder?.peer;
     if (!peer || peer.closed) return;
@@ -817,6 +862,9 @@ export class SessionRegistry extends EventEmitter {
       this.log(`input ${sid}: ${traceBytes(data)} → program ${traceBytes(input)}, ${commands.length} mouse${pending ? `, holding ${traceBytes(Buffer.from(pending, "latin1"))}` : ""}`);
     }
     session.mousePending = pending;
+    session.inputAt = Date.now();
+    // Running again if it ended; a no-op while it runs.
+    this.pasteboard?.start();
     for (const command of commands) {
       if (command.type === "terminal.scroll") this.wheel(session, command.direction);
       else session.controller.send(command);
