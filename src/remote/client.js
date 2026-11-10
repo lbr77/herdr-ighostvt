@@ -139,6 +139,10 @@ export class RemoteClient {
   /// Output waiting to go out: frames for this device are then skipped
   /// and a repaint sent when it has caught up.
   congested() {
+    // A link that is gone holds nothing back: what its sessions draw
+    // meanwhile is kept for the device's return (sessions.js), paced as
+    // any frames are.
+    if (this.closed) return false;
     return this.socket.writableLength > CONGESTED_BYTES || this.inFlight() > CONGESTED_IN_FLIGHT_BYTES;
   }
 
@@ -354,25 +358,51 @@ export class RemoteClient {
           return this.reply(tag, CODE.success, { shells: [process.env.SHELL || "/bin/zsh"] });
         case OP.openSession: {
           if (sessions.heldBy(this).length >= MAXIMUM_SESSIONS_PER_PEER) return this.reply(tag, CODE.sessionLimitReached);
+          const command = commandArgv(message.cmd);
+          if (command === undefined) return this.reply(tag, CODE.invalidRequest);
           const opened = await sessions.open(this, {
             cols: xpc.getNumber(message, "cols"),
             rows: xpc.getNumber(message, "rows"),
             cwd: xpc.getString(message, "cwdpath") ?? sessions.cwdOf(xpc.getNumber(message, "cwdsid")),
+            command,
           });
-          this.reply(tag, CODE.success, { sid: u64(opened.sid), ...foreground(opened), attrs: opened.attrs });
+          this.reply(tag, CODE.success, { sid: u64(opened.sid), ...foreground(opened), attrs: opened.attrs, ooff: u64(opened.offset) });
           return sessions.activate(opened.sid);
         }
         case OP.attachSession: {
           if (sid === undefined) return this.reply(tag, CODE.invalidRequest);
-          const attached = await sessions.attach(this, sid, { takeover: xpc.getBool(message, "takeover") });
+          const attached = await sessions.attach(this, sid, {
+            takeover: xpc.getBool(message, "takeover"),
+            offset: xpc.getU64(message, "ooff"),
+          });
           this.reply(tag, CODE.success, {
             cols: u64(attached.cols),
             rows: u64(attached.rows),
             ...foreground(attached),
             attrs: attached.attrs,
             data: attached.data?.length ? attached.data : undefined,
+            ooff: u64(attached.offset),
+            ores: attached.resumed ? true : undefined,
           });
           return sessions.activate(sid);
+        }
+        case OP.snapshotSession: {
+          if (sid === undefined) return this.reply(tag, CODE.unknownSession);
+          const snapshot = await sessions.snapshot(sid);
+          return this.reply(tag, CODE.success, {
+            cols: u64(snapshot.cols),
+            rows: u64(snapshot.rows),
+            ...foreground(snapshot),
+            attrs: snapshot.attrs,
+            data: snapshot.data.length ? snapshot.data : undefined,
+          });
+        }
+        case OP.injectInput: {
+          const data = xpc.getData(message, "data");
+          if (sid === undefined) return this.reply(tag, CODE.unknownSession);
+          if (!data || data.length === 0 || data.length > MAXIMUM_MESSAGE_DATA_BYTES) return this.reply(tag, CODE.invalidRequest);
+          await sessions.inject(sid, data);
+          return this.reply(tag, CODE.success);
         }
         case OP.detachSession:
           if (sid !== undefined) sessions.detach(this, sid);
@@ -473,6 +503,16 @@ function row(summary) {
     ...foreground(summary),
     attrs: summary.attrs,
   };
+}
+
+/// `openSession`'s `cmd`: an argv of strings, the first not empty. Null
+/// for a shell (absent or empty), undefined for anything malformed.
+function commandArgv(value) {
+  if (value === undefined) return null;
+  if (!Array.isArray(value) || !value.every((word) => typeof word === "string")) return undefined;
+  if (value.length === 0) return null;
+  if (!value[0]) return undefined;
+  return value;
 }
 
 /// `setSessionAttributes`' dictionary: strings only, within the limits.

@@ -12,6 +12,11 @@
 // herdr sends rendered frames, not the program's bytes, so the replay an
 // attach answers with is built here: the lines above the screen, written so
 // that they scroll into the device's scrollback, then a full frame.
+//
+// What a holder is sent is kept as a stream with offsets (iGhostVT 1.6.22's
+// `ooff`): a device whose link drops and comes back within the grace period
+// names how much of it its terminal holds, and gets exactly the rest
+// (`ores`) — no redraw, no history written again.
 
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
@@ -48,7 +53,56 @@ const WHEEL_WAIT_MS = 150;
 /// as that device's copy; a larger copy than this is not sent.
 const COPY_WINDOW_MS = 3000;
 const COPY_BYTES = 256 * 1024;
+/// How much of a holder's recent output is kept for a link that comes back.
+/// More missed than this, and the device is shown the screen again.
+const RESUME_BYTES = 960 * 1024;
+/// What a rebuilt replay starts with, as iGhostVT's own does (a 1.6.22
+/// client no longer clears for it): no frame left half drawn, the primary
+/// screen, DECSTR's baseline, a blank screen — and no scrollback, which the
+/// replay writes again.
+const CLEAN_SLATE = Buffer.from("\x1b[?2026l\x1b[?1049l\x1b[!p\x1b[H\x1b[2J\x1b[3J");
+/// A command a device opens a terminal for is typed once the shell shows
+/// its prompt, or after this long regardless.
+const PROMPT_WAIT_MS = 3000;
 const SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "elvish", "xonsh", "pwsh", "login"]);
+
+/// What a session's holder has been sent, as one stream (`ooff`): where it
+/// stands, and its newest bytes, for a link that drops and comes back to
+/// carry on from where its terminal stopped (`ores`). One per controller:
+/// herdr's frames are drawn against the screen that controller's first one
+/// painted, so they continue nothing else. Each starts past every offset an
+/// earlier one handed out — in this daemon or one before it, since it
+/// starts at the wall clock in nanoseconds — so an offset from another
+/// stream is never mistaken for a place in this one.
+export class OutputStream {
+  constructor(after = 0n) {
+    const now = BigInt(Date.now()) * 1_000_000n;
+    /// Offset of the oldest byte kept, and just past the newest.
+    this.start = now > after ? now : after + 1n;
+    this.end = this.start;
+    this.chunks = [];
+    this.bytes = 0;
+  }
+
+  append(bytes) {
+    if (!bytes.length) return;
+    this.chunks.push(bytes);
+    this.bytes += bytes.length;
+    this.end += BigInt(bytes.length);
+    while (this.chunks.length > 1 && this.bytes - this.chunks[0].length >= RESUME_BYTES) {
+      const dropped = this.chunks.shift();
+      this.bytes -= dropped.length;
+      this.start += BigInt(dropped.length);
+    }
+  }
+
+  /// Everything after `offset`, or null when it is not a place in this
+  /// stream that is still kept, or more than one reply holds.
+  since(offset) {
+    if (typeof offset !== "bigint" || offset < this.start || offset > this.end || this.end - offset > BigInt(RESUME_BYTES)) return null;
+    return Buffer.concat(this.chunks).subarray(Number(offset - this.start));
+  }
+}
 
 export class SessionError extends Error {
   constructor(code, message, extra = {}) {
@@ -98,9 +152,19 @@ class Session {
     /// {peer, name, deviceID} of the connection holding it, or null.
     this.holder = null;
     this.controller = null;
-    /// Frames held back until the open/attach reply has gone out.
+    /// What the holder is sent (OutputStream), while there is a controller;
+    /// and where the last one ended, which the next starts past.
+    this.stream = null;
+    this.streamEnd = 0n;
+    /// Output held back until the open/attach reply has gone out.
     this.gate = null;
     this.lingerTimer = null;
+  }
+
+  /// The stream is over: its controller is gone or replaced.
+  endStream() {
+    if (this.stream) this.streamEnd = this.stream.end;
+    this.stream = null;
   }
 
   describe() {
@@ -290,6 +354,7 @@ export class SessionRegistry extends EventEmitter {
       session.controller.release();
       session.controller = null;
     }
+    session.endStream();
     holder?.peer.sessionExited(session.sid, 0);
   }
 
@@ -302,7 +367,7 @@ export class SessionRegistry extends EventEmitter {
     this.adopt(session, pane);
     if (session.cwd !== cwd) this.announceForeground(session);
     // herdr's frames carry no title; the device's tab shows it this way.
-    if (session.terminalTitle !== title && session.gate === null) this.send(session, titleSequence(session));
+    if (session.terminalTitle !== title) this.send(session, titleSequence(session));
   }
 
   async refreshProcess(session) {
@@ -371,9 +436,11 @@ export class SessionRegistry extends EventEmitter {
     });
   }
 
-  /// A new terminal for `peer`, held by it. Resolves with the session; its
-  /// frames start flowing once `activate(sid)` says the reply went out.
-  async open(peer, { cols, rows, cwd }) {
+  /// A new terminal for `peer`, held by it, running `command` (an argv) in
+  /// place of its shell when there is one. Resolves with the session and
+  /// where its output stream starts; its frames start flowing once
+  /// `activate(sid)` says the reply went out.
+  async open(peer, { cols, rows, cwd, command = null }) {
     if (!(cols > 0 && cols <= MAXIMUM_COLUMNS && rows > 0 && rows <= MAXIMUM_ROWS)) {
       [cols, rows] = [80, 24];
     }
@@ -398,14 +465,36 @@ export class SessionRegistry extends EventEmitter {
     session.rows = rows;
     this.sessions.set(session.sid, session);
     this.save();
-    this.log(`session ${session.sid} opened for ${peer.name} as ${pane.pane_id} (${pane.terminal_id})`);
-    await this.hold(session, peer, { takeover: false, cols, rows });
-    return { sid: session.sid, ...session.describe() };
+    this.log(`session ${session.sid} opened for ${peer.name} as ${pane.pane_id} (${pane.terminal_id})${command ? `, running ${path.basename(command[0])}` : ""}`);
+    const { offset } = await this.hold(session, peer, { takeover: false, cols, rows });
+    if (command) await this.run(session, command);
+    return { sid: session.sid, ...session.describe(), offset };
+  }
+
+  /// herdr starts every terminal with a shell, so a command is typed into
+  /// it as `exec`: the shell becomes the command, and the terminal ends
+  /// when it does — as a session opened for a command does on iGhostVT.
+  /// Typed once the prompt is up, so the line is not echoed twice.
+  async run(session, command) {
+    const deadline = Date.now() + PROMPT_WAIT_MS;
+    while (Date.now() < deadline) {
+      const visible = await herdr.read(session.paneID, "visible").catch(() => null);
+      if (/\S/.test(visible?.text ?? "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    await this.refreshProcess(session);
+    const fish = /fish$/.test(session.proc);
+    const line = ` exec ${command.map((word) => shellQuote(word, { fish })).join(" ")}\r`;
+    if (session.controller) session.controller.input(Buffer.from(line, "utf8"));
+    else await herdr.sendText(session.paneID, line);
   }
 
   /// `peer` takes `sid`. Another device holding it makes it busy unless
   /// `takeover`; the same device's earlier connection gives it up quietly.
-  async attach(peer, sid, { takeover }) {
+  /// `offset` is how much of the session's output the device's terminal
+  /// holds, if it says: the rest goes as it is (`resumed`) when it is still
+  /// here, and the screen is rebuilt otherwise.
+  async attach(peer, sid, { takeover, offset }) {
     const session = this.sessions.get(sid);
     if (!session) throw new SessionError(CODE.unknownSession);
     const previous = session.holder;
@@ -418,7 +507,13 @@ export class SessionRegistry extends EventEmitter {
       }
     }
     await this.refreshProcess(session);
-    const replay = await this.hold(session, peer, {
+    const resumed = this.resume(session, peer, offset);
+    if (resumed) {
+      const { peer: old } = resumed.previous;
+      if (old !== peer && !old.closed) old.sessionTaken(sid, peer.name);
+      return { cols: session.cols, rows: session.rows, ...session.describe(), data: resumed.data, offset: resumed.offset, resumed: true };
+    }
+    const held = await this.hold(session, peer, {
       takeover: takeover || previous !== null,
       cols: session.cols,
       rows: session.rows,
@@ -427,11 +522,39 @@ export class SessionRegistry extends EventEmitter {
     if (previous && previous.peer !== peer && !previous.peer.closed) {
       previous.peer.sessionTaken(sid, peer.name);
     }
-    return { cols: session.cols, rows: session.rows, ...session.describe(), data: replay };
+    return { cols: session.cols, rows: session.rows, ...session.describe(), data: held.data, offset: held.offset };
+  }
+
+  /// The same device back for a session it still holds — its link dropped,
+  /// or a new one came up before the old was seen to go — with its terminal
+  /// at a place in the stream that is still kept: it carries on there, on
+  /// the same controller. Null when it cannot.
+  resume(session, peer, offset) {
+    const holder = session.holder;
+    if (offset === undefined || !holder || holder.deviceID !== peer.deviceID || !session.controller || !session.stream || session.gate) return null;
+    const data = session.stream.since(offset);
+    if (!data) {
+      this.log(`session ${session.sid}: ${peer.name} is back, but what it missed is gone; showing the screen again`);
+      return null;
+    }
+    clearTimeout(session.lingerTimer);
+    session.lingerTimer = null;
+    session.holder = { peer, name: peer.name, deviceID: peer.deviceID };
+    // Half a mouse report from the old link would join the new one's input.
+    session.mousePending = "";
+    // Output from here on waits for the reply, behind what it carries.
+    session.gate = [];
+    // The old link may have paused herdr's stream; the new one says for
+    // itself (`setPaused`).
+    session.controller.child.stdout.resume();
+    this.pasteboard?.start();
+    this.log(`session ${session.sid}: ${peer.name} is back, ${data.length} byte(s) missed`);
+    return { data, offset: session.stream.end, previous: holder };
   }
 
   /// Starts a controller for `peer` and waits for its first full frame.
-  /// With `replay`, resolves with what the device should be shown first.
+  /// Resolves with where its output stream starts and, with `replay`, what
+  /// the device should be shown first.
   async hold(session, peer, { takeover, cols, rows, replay = false }) {
     const old = session.controller;
     if (old) {
@@ -454,13 +577,21 @@ export class SessionRegistry extends EventEmitter {
     }
     const controller = new Controller(session.terminalID, { cols, rows, takeover });
     session.controller = controller;
-    // Every frame is held from the first on: the first may be the replay,
-    // and the rest wait for the reply to go out (`activate`).
+    session.endStream();
+    const stream = new OutputStream(session.streamEnd);
+    session.stream = stream;
+    // Output waits for the reply to go out (`activate`). For a replay, the
+    // first frame is not output: it ends the replay.
     const gate = [];
     session.gate = gate;
+    let first = null;
     let waiting = null;
     controller.on("frame", (frame) => {
-      this.deliver(session, controller, frame);
+      if (replay && waiting) {
+        first = this.firstFrame(session, frame);
+      } else {
+        this.deliver(session, controller, frame);
+      }
       waiting?.frame();
     });
     controller.on("closed", (closed) => {
@@ -488,7 +619,10 @@ export class SessionRegistry extends EventEmitter {
         },
       };
     }).catch((error) => {
-      if (session.controller === controller) session.controller = null;
+      if (session.controller === controller) {
+        session.controller = null;
+        session.endStream();
+      }
       if (session.gate === gate) session.gate = null;
       if (old) {
         // Its listeners are gone; nothing would hear from it again.
@@ -507,18 +641,26 @@ export class SessionRegistry extends EventEmitter {
     if (!replay) {
       // A new terminal: everything that scrolls off from now on is news.
       session.historySent = 0;
-      return null;
+      return { data: null, offset: stream.start };
     }
     // Read once herdr has the terminal at the device's size, so the lines
     // are wrapped as they will be shown.
-    const first = gate.shift();
     const { bytes: lines, total } = await this.history(session).catch(() => ({ bytes: Buffer.alloc(0), total: null }));
     session.historySent = total;
     // Said either way: the device's terminal may still have it from before.
     session.mouse = fullScreen(session, total);
-    const head = Buffer.concat([titleSequence(session), session.mouse ? MOUSE_ON : MOUSE_OFF]);
+    const head = Buffer.concat([CLEAN_SLATE, titleSequence(session), session.mouse ? MOUSE_ON : MOUSE_OFF]);
     const room = Math.max(0, REPLAY_BYTES - first.length - head.length);
-    return Buffer.concat([head, lines.length > room ? lines.subarray(lines.length - room) : lines, first]);
+    return { data: Buffer.concat([head, lines.length > room ? lines.subarray(lines.length - room) : lines, first]), offset: stream.start };
+  }
+
+  /// A controller's first frame, which a replay ends with.
+  firstFrame(session, frame) {
+    if (frame.width && frame.height) {
+      session.cols = frame.width;
+      session.rows = frame.height;
+    }
+    return compactFrame(frame.bytes, frame.width || session.cols);
   }
 
   /// The reply for `sid` is out: frames held back go now.
@@ -774,7 +916,15 @@ export class SessionRegistry extends EventEmitter {
     this.send(target, Buffer.from(`\x1b]52;c;${bytes.toString("base64")}\x07`));
   }
 
+  /// Output for the session's holder. Kept in its stream even while its
+  /// link is down, for the device to be handed when it comes back.
   send(session, bytes) {
+    if (!bytes.length) return;
+    if (session.gate) {
+      session.gate.push(bytes);
+      return;
+    }
+    session.stream?.append(bytes);
     const peer = session.holder?.peer;
     if (!peer || peer.closed) return;
     for (let offset = 0; offset < bytes.length; offset += OUTPUT_CHUNK_BYTES) {
@@ -790,6 +940,7 @@ export class SessionRegistry extends EventEmitter {
   async controllerClosed(session, controller, { reason, taken }) {
     if (session.controller !== controller) return;
     session.controller = null;
+    session.endStream();
     session.gate = null;
     if (!taken) {
       for (let attempt = 0; attempt < 5 && this.sessions.has(session.sid); attempt++) {
@@ -830,6 +981,7 @@ export class SessionRegistry extends EventEmitter {
     session.wheel = null;
     session.holder = null;
     session.gate = null;
+    session.endStream();
     if (session.controller) {
       const controller = session.controller;
       controller.removeAllListeners("closed");
@@ -926,7 +1078,10 @@ export class SessionRegistry extends EventEmitter {
   }
 
   linger(session, peer) {
+    // Nothing waits for a reply that cannot arrive; into the stream it goes.
+    const held = session.gate ?? [];
     session.gate = null;
+    for (const bytes of held) this.send(session, bytes);
     clearTimeout(session.lingerTimer);
     session.lingerTimer = setTimeout(() => {
       if (session.holder?.peer === peer) this.letGo(session);
@@ -959,7 +1114,16 @@ export class SessionRegistry extends EventEmitter {
   /// Resolves with the bytes and with how many lines herdr's history held,
   /// which the scrollback sync counts on from.
   async history(session) {
-    if (!session.paneID) return { bytes: Buffer.alloc(0), total: null };
+    const { above, total } = await this.readLines(session);
+    if (!above.length) return { bytes: Buffer.alloc(0), total };
+    return { bytes: Buffer.from(above.join("\r\n") + "\x1b[0m" + "\r\n".repeat(session.rows), "utf8"), total };
+  }
+
+  /// herdr's text of the pane: the lines above the screen (none when its
+  /// two reads do not line up), the screen's, and how many lines its
+  /// history holds.
+  async readLines(session) {
+    if (!session.paneID) return { above: [], visible: [], total: null };
     const [recent, visible, pane] = await Promise.all([
       herdr.read(session.paneID, "recent", HISTORY_LINES),
       herdr.read(session.paneID, "visible"),
@@ -969,12 +1133,66 @@ export class SessionRegistry extends EventEmitter {
     const recentLines = (recent?.text ?? "").split("\r\n");
     const visibleLines = (visible?.text ?? "").split("\r\n");
     const count = recentLines.length - visibleLines.length;
-    if (count <= 0) return { bytes: Buffer.alloc(0), total };
-    const tail = recentLines.slice(count).join("\r\n");
-    if (tail !== visibleLines.join("\r\n")) return { bytes: Buffer.alloc(0), total };
-    const lines = recentLines.slice(0, count);
-    return { bytes: Buffer.from(lines.join("\r\n") + "\x1b[0m" + "\r\n".repeat(session.rows), "utf8"), total };
+    const lines = { above: [], visible: visibleLines, total };
+    if (count <= 0 || recentLines.slice(count).join("\r\n") !== visibleLines.join("\r\n")) return lines;
+    lines.above = recentLines.slice(0, count);
+    return lines;
   }
+
+  /// The session's screen and history without taking it (`snapshotSession`,
+  /// the CLI's `capture`): whoever holds it keeps it. Read from herdr, as a
+  /// replay is, the screen as text where a replay has a frame.
+  async snapshot(sid) {
+    const session = this.sessions.get(sid);
+    if (!session) throw new SessionError(CODE.unknownSession);
+    await this.refreshProcess(session);
+    // A held terminal is at its holder's size; one nobody holds, at its pane's.
+    const size = (!session.controller && session.paneID && (await paneSize(session.paneID))) || { cols: session.cols, rows: session.rows };
+    let lines;
+    try {
+      lines = await this.readLines(session);
+    } catch (error) {
+      throw new SessionError(CODE.operationFailed, `herdr could not read the terminal: ${error.message}`);
+    }
+    const screen = Buffer.from("\x1b[H" + lines.visible.join("\x1b[0m\r\n") + "\x1b[0m", "utf8");
+    let history = lines.above.length ? Buffer.from(lines.above.join("\r\n") + "\x1b[0m" + "\r\n".repeat(size.rows), "utf8") : Buffer.alloc(0);
+    const room = Math.max(0, REPLAY_BYTES - CLEAN_SLATE.length - screen.length);
+    if (history.length > room) history = history.subarray(history.length - room);
+    return { cols: size.cols, rows: size.rows, ...session.describe(), data: Buffer.concat([CLEAN_SLATE, history, screen]) };
+  }
+
+  /// `data` typed into a session without holding it (`injectInput`, the
+  /// CLI's `send`): through the controller of whoever holds it, so it goes
+  /// in order with theirs, and otherwise straight into herdr's pane.
+  async inject(sid, data) {
+    const session = this.sessions.get(sid);
+    if (!session) throw new SessionError(CODE.unknownSession);
+    if (session.controller) {
+      if (session.controller.child.stdin.writableLength > 4 << 20) throw new SessionError(CODE.inputBacklog);
+      session.controller.input(data);
+      return;
+    }
+    if (!session.paneID) throw new SessionError(CODE.unknownSession);
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(data);
+    } catch {
+      throw new SessionError(CODE.invalidRequest, "Input to a terminal nobody has open must be UTF-8 text.");
+    }
+    try {
+      await herdr.sendText(session.paneID, text);
+    } catch (error) {
+      throw new SessionError(CODE.operationFailed, `herdr could not type into the terminal: ${error.message}`);
+    }
+  }
+}
+
+/// One word of a command line, as a shell reads it back: single-quoted,
+/// with fish's backslash escapes inside the quotes where that is the shell.
+export function shellQuote(word, { fish = false } = {}) {
+  const text = String(word);
+  if (fish) return `'${text.replace(/[\\']/g, (character) => `\\${character}`)}'`;
+  return `'${text.replace(/'/g, "'\\''")}'`;
 }
 
 function isDirectory(directory) {

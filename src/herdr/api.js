@@ -136,6 +136,9 @@ export const herdr = {
   paneList: async (workspaceID) => (await request("pane.list", workspaceID ? { workspace_id: workspaceID } : {})).panes,
   paneGet: async (paneID) => (await request("pane.get", { pane_id: paneID })).pane,
   paneClose: (paneID) => request("pane.close", { pane_id: paneID }),
+  /// Into the pane's terminal as it is: control characters act, no paste
+  /// brackets are added.
+  sendText: (paneID, text) => request("pane.send_text", { pane_id: paneID, text }),
   processInfo: async (paneID) => (await request("pane.process_info", { pane_id: paneID })).process_info,
   read: async (paneID, source, lines) => (await request("pane.read", {
     pane_id: paneID, source, format: "ansi", strip_ansi: false, ...(lines ? { lines } : {}),

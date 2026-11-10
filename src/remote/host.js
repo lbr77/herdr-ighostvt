@@ -4,6 +4,7 @@
 
 import crypto from "node:crypto";
 import net from "node:net";
+import os from "node:os";
 import tls from "node:tls";
 import { EventEmitter } from "node:events";
 import { RemoteClient } from "./client.js";
@@ -22,8 +23,11 @@ const CIPHERS = "ECDHE-PSK-CHACHA20-POLY1305";
 /// the same machine holds 46404.
 const FALLBACK_PORTS = [46414, 46424, 46434, 0];
 
-/// RemoteNetwork.isLocal: private, link-local and loopback addresses only.
-export function isLocalAddress(address) {
+/// RemoteNetwork.isLocal: private, link-local and loopback addresses, and a
+/// global IPv6 address inside a prefix one of this machine's own interfaces
+/// is on — the same link: Bonjour hands a device the global address as
+/// readily as the link-local one on a dual-stack network (iGhostVT 1.6.7).
+export function isLocalAddress(address, interfaces = os.networkInterfaces()) {
   if (!address) return false;
   let host = address.replace(/%.*$/, "").toLowerCase();
   const mapped = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
@@ -35,9 +39,54 @@ export function isLocalAddress(address) {
   if (net.isIPv6(host)) {
     if (host === "::1") return true;
     const first = Number.parseInt(host.split(":")[0] || "0", 16);
-    return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80;
+    if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) return true;
+    return isOnLink(ipv6Bytes(host), interfaces);
   }
   return false;
+}
+
+/// Interfaces that are not the local network whatever prefix they hold: a
+/// VPN's or a proxy app's tunnel, a point-to-point link.
+const TUNNEL_INTERFACE = /^(utun|ipsec|ppp|gif|stf|tun|tap|wg)\d*/;
+
+function isOnLink(bytes, interfaces) {
+  for (const [name, entries] of Object.entries(interfaces ?? {})) {
+    if (TUNNEL_INTERFACE.test(name)) continue;
+    for (const entry of entries ?? []) {
+      if (entry.family !== "IPv6" && entry.family !== 6) continue;
+      if (entry.internal || !entry.netmask) continue;
+      const own = ipv6Bytes(entry.address.replace(/%.*$/, ""));
+      const mask = ipv6Bytes(entry.netmask);
+      // A link-local entry's prefix matches every link-local peer; those
+      // were decided already, and it says nothing of a global one.
+      if (!own || !mask || (own[0] === 0xfe && (own[1] & 0xc0) === 0x80) || mask.every((byte) => byte === 0)) continue;
+      if (own.every((byte, index) => (byte & mask[index]) === (bytes[index] & mask[index]))) return true;
+    }
+  }
+  return false;
+}
+
+/// The 16 bytes of an IPv6 address, or null.
+function ipv6Bytes(text) {
+  if (!net.isIPv6(text)) return null;
+  let [head, tail] = text.split("::");
+  const groups = (part) => (part ? part.split(":") : []);
+  let left = groups(head);
+  let right = tail === undefined ? [] : groups(tail);
+  // An embedded IPv4 tail (::ffff:1.2.3.4) is two groups.
+  const last = (tail === undefined ? left : right).at(-1);
+  if (last && last.includes(".")) {
+    const [a, b, c, d] = last.split(".").map(Number);
+    const replaced = [((a << 8) | b).toString(16), ((c << 8) | d).toString(16)];
+    if (tail === undefined) left = [...left.slice(0, -1), ...replaced];
+    else right = [...right.slice(0, -1), ...replaced];
+  }
+  const missing = 8 - left.length - right.length;
+  const all = tail === undefined ? left : [...left, ...Array(missing).fill("0"), ...right];
+  if (all.length !== 8) return null;
+  const bytes = Buffer.alloc(16);
+  all.forEach((group, index) => bytes.writeUInt16BE(Number.parseInt(group, 16), index * 2));
+  return [...bytes];
 }
 
 export class RemoteHost extends EventEmitter {

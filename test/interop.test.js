@@ -67,6 +67,14 @@ async function pairDevice(label) {
 
 const connect = (label, extra = {}) => Device.connect({ port, hostID, deviceID: devices[label].deviceID, key: devices[label].key, deviceName: label, ...extra });
 
+/// What a rebuilt replay starts with (sessions.js).
+const CLEAN_SLATE = "\x1b[?2026l\x1b[?1049l\x1b[!p\x1b[H\x1b[2J\x1b[3J";
+
+/// The bytes the session's output events carried, as the app counts them.
+function outputBytes(device, sid) {
+  return Buffer.concat(device.events.filter((event) => num(event.ev) === 100 && num(event.sid) === sid).map((event) => bytes(event.data)));
+}
+
 /// Replays what a device was sent for `sid` into a terminal of its size.
 function screenOf(device, sid, columns, rows, replay) {
   const terminal = new Terminal(columns, rows);
@@ -271,6 +279,119 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
     await a.close();
   });
 
+  test("a device back within the grace period carries on where its terminal stopped", async () => {
+    const a = await connect("Device A");
+    const opened = await a.request(3, { cols: U(60), rows: U(12), cwdpath: os.tmpdir() });
+    const sid = num(opened.sid);
+    const start = BigInt(opened.ooff.u64);
+    await sleep(800);
+    a.send(6, { sid: U(sid), data: D("clear; echo before-$((3*3))\r") });
+    await a.waitForOutput(sid, "before-9");
+    await sleep(800);
+    await a.close();
+    const held = outputBytes(a, sid);
+
+    // While A's link is down the session prints on: another device types
+    // into it without taking it (the CLI's `send`).
+    const b = await connect("Device B");
+    assert.equal(num((await b.request(12, { sid: U(sid), data: D("echo away-$((7*11))\r") })).code), 0);
+    await sleep(1200);
+    const back = await connect("Device A");
+    const attached = await back.request(4, { sid: U(sid), ooff: U(start + BigInt(held.length)) });
+    assert.equal(num(attached.code), 0);
+    assert.equal(attached.ores, true, "a continuation");
+    const missed = bytes(attached.data);
+    assert.ok(!missed.includes(CLEAN_SLATE), "nothing is redrawn");
+    assert.equal(BigInt(attached.ooff.u64), start + BigInt(held.length + missed.length), "the reply's offset is where its data ends");
+    const terminal = new Terminal(60, 12);
+    terminal.write(held);
+    terminal.write(missed);
+    assert.ok(terminal.screenLines().includes("before-9"), JSON.stringify(terminal.screenLines()));
+    assert.ok(terminal.screenLines().includes("away-77"), "what it missed, and only that, puts its screen right");
+
+    back.send(6, { sid: U(sid), data: D("echo live-$((2*4))\r") });
+    await back.waitForOutput(sid, "live-8");
+    await sleep(500);
+    terminal.write(outputBytes(back, sid));
+    assert.ok(terminal.screenLines().includes("live-8"), "and goes on live from there");
+
+    // Let go and taken again, the stream is a new one: an offset from the
+    // old is out of reach, and the screen is rebuilt.
+    back.send(5, { sid: U(sid) });
+    await sleep(300);
+    const end = start + BigInt(held.length + missed.length + outputBytes(back, sid).length);
+    const again = await back.request(4, { sid: U(sid), ooff: U(end) });
+    assert.equal(num(again.code), 0);
+    assert.equal(again.ores, undefined);
+    assert.ok(BigInt(again.ooff.u64) > end, "a new stream starts past the old");
+    const replay = bytes(again.data).toString();
+    assert.ok(replay.startsWith(CLEAN_SLATE), "a rebuild clears what the terminal held");
+    const rebuilt = new Terminal(num(again.cols), num(again.rows));
+    rebuilt.write(replay);
+    assert.ok(rebuilt.allLines().includes("live-8"));
+    await back.request(8, { sid: U(sid) });
+    await back.close();
+    await b.close();
+  });
+
+  test("the CLI's capture and send reach a terminal without taking it", async () => {
+    const device = await connect("Device A");
+    const sid = num((await device.request(3, { cols: U(70), rows: U(14), cwdpath: os.tmpdir() })).sid);
+    await sleep(800);
+    device.send(6, { sid: U(sid), data: D("clear; for i in $(seq 1 30); do echo line-$i; done\r") });
+    await device.waitForOutput(sid, "line-30");
+    await sleep(500);
+
+    const cli = await connect("Device B");
+    const snapshot = await cli.request(11, { sid: U(sid) });
+    assert.equal(num(snapshot.code), 0);
+    assert.deepEqual([num(snapshot.cols), num(snapshot.rows)], [70, 14], "at its holder's size");
+    let terminal = new Terminal(70, 14);
+    terminal.write(bytes(snapshot.data));
+    const lines = terminal.allLines().filter((line) => /^line-\d+$/.test(line)).map((line) => Number(line.slice(5)));
+    assert.deepEqual(lines, Array.from({ length: 30 }, (_, index) => index + 1), "screen and history");
+    let row = (await cli.request(2)).sessions.find((entry) => num(entry.sid) === sid);
+    assert.equal(row.holder, "Device A", "the holder keeps it");
+
+    assert.equal(num((await cli.request(12, { sid: U(sid), data: D("echo sent-$((5*5))\r") })).code), 0);
+    await device.waitForOutput(sid, "sent-25");
+
+    device.send(5, { sid: U(sid) });
+    await sleep(500);
+    row = (await cli.request(2)).sessions.find((entry) => num(entry.sid) === sid);
+    assert.equal(row.attached, false);
+    assert.equal(num((await cli.request(12, { sid: U(sid), data: D("echo alone-$((6*6))\r") })).code), 0, "typed into herdr's pane itself");
+    await waitUntil(async () => {
+      const seen = await cli.request(11, { sid: U(sid) });
+      terminal = new Terminal(num(seen.cols), num(seen.rows));
+      terminal.write(bytes(seen.data));
+      return terminal.screenLines().includes("alone-36");
+    }, 5000, "the input in a terminal nobody holds");
+    assert.equal(num((await cli.request(12, { sid: U(sid), data: D(Buffer.from([0xff, 0xfe])) })).code), 1, "only text goes to herdr's pane");
+
+    assert.equal(num((await cli.request(11, { sid: U(987654) })).code), 5);
+    assert.equal(num((await cli.request(12, { sid: U(987654), data: D("x") })).code), 5);
+    await cli.request(8, { sid: U(sid) });
+    await cli.close();
+    await device.close();
+  });
+
+  test("a terminal opened for a command runs it, and ends with it", async () => {
+    const device = await connect("Device A");
+    const opened = await device.request(3, {
+      cols: U(80), rows: U(24), cwdpath: os.tmpdir(),
+      cmd: ["/bin/sh", "-c", 'echo cmd-$((6*7)) "$0"; sleep 1', "it's"],
+    });
+    assert.equal(num(opened.code), 0);
+    const sid = num(opened.sid);
+    // herdr draws the words apart; the screen reads them together.
+    await device.waitFor(() => screenOf(device, sid, 80, 24).allLines().includes("cmd-42 it's"));
+    await device.waitFor((event) => num(event.ev) === 101 && num(event.sid) === sid, 10_000);
+    assert.equal(num((await device.request(3, { cols: U(80), rows: U(24), cmd: [""] })).code), 1);
+    assert.equal(num((await device.request(3, { cols: U(80), rows: U(24), cmd: [U(1)] })).code), 1);
+    await device.close();
+  });
+
   test("every herdr pane is a session, and goes back as it was", async () => {
     const { request } = await import("../src/herdr/api.js");
     const { paneSize } = await import("../src/herdr/ttysize.js");
@@ -285,7 +406,7 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
 
     const attached = await device.request(4, { sid: U(sid) });
     assert.equal(num(attached.code), 0);
-    assert.ok(bytes(attached.data).toString().startsWith("\x1b]2;fixing-the-build\x07"), "the replay carries the title");
+    assert.ok(bytes(attached.data).toString().startsWith(CLEAN_SLATE + "\x1b]2;fixing-the-build\x07"), "the replay starts from a clean slate, then the title");
     device.send(7, { sid: U(sid), cols: U(41), rows: U(13) });
     await waitUntil(async () => {
       const size = await paneSize(paneID);

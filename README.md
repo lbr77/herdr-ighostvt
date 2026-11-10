@@ -11,8 +11,9 @@ device can pick up, and a tab the app opens is a new tab in herdr's
 
 The app needs no change: the plugin speaks iGhostVT's own remote protocol
 (TLS 1.2 PSK, SPAKE2+ pairing, the IOWire session frames of protocol 2,
-with the LZFSE frame compression and link window of iGhostVT 1.6) and its
-relay protocol.
+with the LZFSE frame compression and link window of iGhostVT 1.6 and the
+output offsets of 1.6.22) and its relay protocol. `ighostvt-cli --host`
+works with it too.
 
 ## Requirements
 
@@ -67,6 +68,13 @@ a shell or agent you started in herdr is just let go.
 The action **iGhostVT bridge** opens a panel with the paired devices and the
 relay: `p` pair, `u` unpair the selected device, `i` import a relay
 configuration, `x` remove it, `n` rename the host.
+
+`ighostvt-cli` on a Mac paired with the host reaches its terminals as well
+(`ighostvt-cli --host <name> list | capture | send | new | kill`), without
+taking a terminal a device holds. `capture` shows herdr's text of the pane.
+`new <command>` opens a herdr tab and types `exec <command>` into its shell,
+because herdr starts every terminal with one; the tab ends when the command
+does.
 
 ## Relay
 
@@ -124,6 +132,15 @@ device's scrollback itself: an attach replays herdr's history before the
 screen, and while a session is shown, lines that scroll off are written into
 the device's scrollback shortly after (best effort — under a flood of output a
 few lines can be repeated or missed).
+
+When a device's link drops, the session stays held for it for 30 seconds,
+and the bridge keeps what it would have been sent (up to 960 KiB). A device
+on iGhostVT 1.6.22 or newer that comes back in that time says how much it
+holds, and gets exactly the rest: its screen and scrollback carry on with
+nothing redrawn or repeated. Otherwise (a device on an older 1.6, one away
+longer, or a session another device took in the meantime) the screen is
+rebuilt: the device's terminal is cleared, scrollback included, and herdr's
+history and screen are sent again.
 
 Known differences from a terminal on an iGhostVT host:
 
@@ -220,6 +237,7 @@ one (or `IGHOSTVT=…`), Xcode and Go:
 
 ```sh
 make -C interop          # builds interop/build/{spake-oracle,ghostvt-client,ighostvt-relay}
+make -C interop -B IGHOSTVT=/path/to/iGhostVT   # from a checkout elsewhere
 npm test
 ```
 
