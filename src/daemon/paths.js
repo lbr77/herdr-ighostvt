@@ -6,12 +6,21 @@ import os from "node:os";
 import path from "node:path";
 import { ensurePrivateDirectory, stateDirectory } from "../store.js";
 
-export function controlSocketPath() {
-  const preferred = path.join(stateDirectory(), "ctl.sock");
+function socketPath(name) {
+  const preferred = path.join(stateDirectory(), name);
   // sun_path holds 104 bytes on macOS, 108 on Linux.
   if (Buffer.byteLength(preferred) < 100) return preferred;
   const digest = crypto.createHash("sha256").update(preferred).digest("hex").slice(0, 12);
   return path.join(os.tmpdir(), `ghostvt-${process.getuid?.() ?? 0}-${digest}.sock`);
+}
+
+export function controlSocketPath() {
+  return socketPath("ctl.sock");
+}
+
+/// Where src/zmodem/wrap.js hands a transfer to the bridge.
+export function zmodemSocketPath() {
+  return socketPath("zmodem.sock");
 }
 
 export function logPath() {

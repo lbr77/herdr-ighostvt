@@ -16,6 +16,7 @@ import { sanitizedName } from "../remote/protocol.js";
 import { serveControl, isRunning } from "./control.js";
 import { logPath, makeLog } from "./paths.js";
 import { PLUGIN_ROOT, Updater } from "./updater.js";
+import { serveZmodem } from "../zmodem/server.js";
 
 const log = makeLog();
 /// herdr gone for this long ends the daemon; the startup hook brings it
@@ -95,6 +96,7 @@ async function main() {
     log,
   });
   await sessions.start();
+  const zmodem = serveZmodem(sessions, log);
   const host = new RemoteHost({ store, sessions, log, config: { ...config, defaultName: sanitizedName(config.name || defaultHostName()) } });
   await host.listen();
 
@@ -234,6 +236,7 @@ async function main() {
     relay?.stop();
     host.close();
     sessions.stop();
+    zmodem.close();
     control.close();
     // Long enough for the panes devices held to get their size back. A
     // daemon with a successor to start waits it out; one without may be

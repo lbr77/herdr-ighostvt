@@ -53,6 +53,7 @@ export class Device {
           else if (line.kind === "stats") this.onStats?.(line);
           else if (line.kind === "event") {
             this.events.push(line.msg);
+            this.onEvent?.(line.msg);
             this.check();
           } else if (line.kind === "closed" || line.kind === "error") {
             this.closed = line.reason ?? line.err;

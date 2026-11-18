@@ -90,6 +90,42 @@ node src/cli.js relay import relay.vtrpsc
 Pairing through the relay is refused unless the pairing window allows it
 (`r` on the pairing screen, or `node src/cli.js pair --relay`).
 
+## rz and sz (ZMODEM)
+
+iGhostVT receives files a program sends with `sz` and sends files to `rz`
+(Settings ▸ Advanced turns that on in the app). herdr, though, shows a
+device its own rendering of a pane, never the bytes the program wrote, so
+a transfer cannot cross it: the app never sees one start, and herdr draws
+it as garbage. The bridge carries transfers past herdr instead, with one
+line in `~/.zshrc` (or `~/.bashrc`) — `node src/cli.js zmodem` prints it
+with this plugin's path:
+
+```sh
+. /path/to/herdr-ghostvt/shell/zmodem.sh
+```
+
+In a herdr pane, that runs `ssh`, `rz` and `sz` through
+`src/zmodem/wrap.js`. The program keeps the pane as its input (ssh still
+puts the terminal in raw mode, follows its size and allocates a remote
+terminal); only its output passes through the wrapper, which hands it on
+untouched until a transfer starts. The transfer goes to the bridge, and from
+there to the device holding the pane, as that session's output; the
+device's answers go back as its typing does. So `sz file` or `rz` on a
+server you reached with `ssh` from the pane works as it does in iGhostVT's
+own terminals, as does lrzsz in the pane itself.
+
+- herdr's own view of the pane shows the program's messages around a
+  transfer but not the transfer; the device's screen is painted again when
+  it ends.
+- A device whose link drops in the middle and comes back within 30 seconds
+  carries on with the transfer. A device that closes or lets go of the pane
+  instead stops the program at the other end, as a cancel in the app does.
+- A pane no device holds gets the transfer as before (into herdr).
+- Only what runs in a shell that sourced the line goes through it: not
+  scripts, not `scp`/`git` (they run `ssh` themselves), not output that is
+  not a terminal. `command ssh …` skips it once; `ghostvt_zmodem <program>
+  …` wraps another program the same way.
+
 ## Configuration
 
 Optional, in the plugin's config directory (`herdr plugin config-dir ghostvt`),
@@ -185,6 +221,7 @@ In the plugin's state directory (`~/.local/state/herdr/plugins/ghostvt`):
 | `sessions.json` | Which herdr terminals are which iGhostVT sessions |
 | `daemon.log` | The bridge's log. Started with `GHOSTVT_TRACE_INPUT=1` (`GHOSTVT_TRACE_INPUT=1 node src/cli.js start`), the bridge also logs each write from a device with its text as dots, to see which keys and mouse reports arrive |
 | `ctl.sock` | How the actions and `src/cli.js` reach the bridge |
+| `zmodem.sock` | Where `src/zmodem/wrap.js` hands the bridge a transfer |
 
 The relay configuration is kept as `relay.vtrpsc` in the config directory.
 
@@ -198,6 +235,7 @@ node src/cli.js relay import <file> | relay remove
 node src/cli.js rename [name]
 node src/cli.js update [--check]
 node src/cli.js start | stop | restart
+node src/cli.js zmodem        # the line for ~/.zshrc (see rz and sz)
 ```
 
 ## Updates
@@ -242,7 +280,10 @@ npm test
 ```
 
 They run against a herdr server of their own (`herdr --session
-ghostvt-test-<pid>`), never the user's.
+ghostvt-test-<pid>`), never the user's. The ZMODEM tests need lrzsz
+(`brew install lrzsz`); real lrzsz on the test's side stands in for the
+app's engine, and the ssh one runs an sshd of its own, as this user, on a
+free port with keys of its own (skipped when that cannot start).
 
 | Path | What |
 |---|---|
@@ -250,6 +291,7 @@ ghostvt-test-<pid>`), never the user's.
 | `src/crypto/` | P-256 and SPAKE2+ (corecrypto's variant) |
 | `src/wire/` | IOWire frames, the XPC value codec, and an LZVN encoder for frame compression |
 | `src/herdr/` | herdr's socket API, terminal streams, the session registry |
+| `src/zmodem/`, `shell/` | rz/sz past herdr: the wrapper, where a transfer starts and ends, the bridge's socket, the shell line |
 | `src/daemon/` | The background process and its control socket |
 | `src/panes/`, `src/actions/` | The popup panes and the actions that open them |
 

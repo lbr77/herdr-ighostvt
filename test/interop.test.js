@@ -75,6 +75,45 @@ function outputBytes(device, sid) {
   return Buffer.concat(device.events.filter((event) => num(event.ev) === 100 && num(event.sid) === sid).map((event) => bytes(event.data)));
 }
 
+/// What a pane's shell types to run a program through src/zmodem/wrap.js.
+const WRAP = `'${process.execPath}' '${path.join(ROOT, "src/zmodem/wrap.js")}'`;
+
+/// Stands in for the app's ZMODEM engine: once the device is sent the start
+/// of a transfer — a sender's ZRQINIT for `rz`, a receiver's ZRINIT for `sz`
+/// — real lrzsz here is fed the device's output from there on, and what it
+/// answers goes back as the device's typing. Resolves when it exits.
+function zmodemPeer(device, sid, argv, cwd) {
+  const trigger = Buffer.from(argv[0] === "rz" ? "**\x18B00" : "**\x18B01", "latin1");
+  return new Promise((resolve, reject) => {
+    let child = null;
+    let pending = Buffer.alloc(0);
+    const timer = setTimeout(() => {
+      device.onEvent = null;
+      child?.kill();
+      reject(new Error(child ? "the transfer did not finish" : "no transfer began"));
+    }, 60_000);
+    device.onEvent = (event) => {
+      if (num(event.ev) !== 100 || num(event.sid) !== sid) return;
+      const data = bytes(event.data);
+      if (child) return child.stdin.write(data);
+      pending = Buffer.concat([pending, data]);
+      const at = pending.indexOf(trigger);
+      if (at < 0) return;
+      child = spawn(argv[0], argv.slice(1), { cwd, stdio: ["pipe", "pipe", "pipe"] });
+      child.stdin.on("error", () => {});
+      child.stdin.write(pending.subarray(at));
+      child.stdout.on("data", (chunk) => device.send(6, { sid: U(sid), data: D(chunk) }));
+      let errors = "";
+      child.stderr.on("data", (chunk) => (errors += chunk));
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        device.onEvent = null;
+        resolve({ code, errors });
+      });
+    };
+  });
+}
+
 /// Replays what a device was sent for `sid` into a terminal of its size.
 function screenOf(device, sid, columns, rows, replay) {
   const terminal = new Terminal(columns, rows);
@@ -566,6 +605,174 @@ describe("the bridge against herdr and iGhostVT's client", { skip, concurrency: 
       fs.rmSync(path.dirname(begun.path), { recursive: true, force: true });
       await device.close();
     }
+  });
+
+  describe("ZMODEM through src/zmodem/wrap.js", { skip: spawnSync("sz", ["--version"]).status === 0 ? false : "lrzsz is not installed" }, () => {
+    let host;
+    let local;
+    before(() => {
+      host = fs.mkdtempSync(path.join(os.tmpdir(), "ghostvt-host-"));
+      local = fs.mkdtempSync(path.join(os.tmpdir(), "ghostvt-device-"));
+    });
+    after(() => {
+      fs.rmSync(host, { recursive: true, force: true });
+      fs.rmSync(local, { recursive: true, force: true });
+    });
+
+    /// herdr's own text of the pane: none of a transfer may be in it.
+    async function assertPaneClean(device, sid) {
+      const text = bytes((await device.request(11, { sid: U(sid) })).data).toString("utf8");
+      assert.doesNotMatch(text, /\*\*\x18?B0|B00000000000000|\uFFFD/, `herdr's screen has no part of the transfer: ${JSON.stringify(text.slice(-400))}`);
+    }
+
+    test("sz in a pane sends a file to the device past herdr", async () => {
+      const device = await connect("Device A");
+      const content = crypto.randomBytes(600_000);
+      fs.writeFileSync(path.join(host, "down.bin"), content);
+      const sid = num((await device.request(3, { cols: U(80), rows: U(24), cwdpath: host })).sid);
+      await sleep(1000);
+      const received = zmodemPeer(device, sid, ["rz", "-y"], local);
+      device.send(6, { sid: U(sid), data: D(`${WRAP} sz down.bin\r`) });
+      const { code, errors } = await received;
+      assert.equal(code, 0, errors);
+      assert.deepEqual(fs.readFileSync(path.join(local, "down.bin")), content);
+      device.send(6, { sid: U(sid), data: D("echo after-$((6*7))\r") });
+      await device.waitForOutput(sid, "after-42");
+      await assertPaneClean(device, sid);
+      await device.request(8, { sid: U(sid) });
+      await device.close();
+    });
+
+    test("rz in a pane takes a file from the device", async () => {
+      const device = await connect("Device A");
+      const content = crypto.randomBytes(300_000);
+      fs.writeFileSync(path.join(local, "up.bin"), content);
+      const sid = num((await device.request(3, { cols: U(80), rows: U(24), cwdpath: host })).sid);
+      await sleep(1000);
+      // -e escapes every control byte, as the app's sender does.
+      const sent = zmodemPeer(device, sid, ["sz", "-e", "up.bin"], local);
+      device.send(6, { sid: U(sid), data: D(`${WRAP} rz -y\r`) });
+      const { code, errors } = await sent;
+      assert.equal(code, 0, errors);
+      await waitUntil(() => fs.existsSync(path.join(host, "up.bin")) && fs.statSync(path.join(host, "up.bin")).size === content.length, 10_000, "the file");
+      assert.deepEqual(fs.readFileSync(path.join(host, "up.bin")), content);
+      device.send(6, { sid: U(sid), data: D("echo after-$((7*7))\r") });
+      await device.waitForOutput(sid, "after-49");
+      await assertPaneClean(device, sid);
+      await device.request(8, { sid: U(sid) });
+      await device.close();
+    });
+
+    test("a device that lets go in the middle stops the transfer, and the shell comes back", async () => {
+      const device = await connect("Device A");
+      fs.writeFileSync(path.join(host, "big.bin"), crypto.randomBytes(2_000_000));
+      const sid = num((await device.request(3, { cols: U(80), rows: U(24), cwdpath: host })).sid);
+      await sleep(1000);
+      device.send(6, { sid: U(sid), data: D(`${WRAP} sz big.bin; echo sz-ended-$((40+2))\r`) });
+      await device.waitForOutput(sid, "**\x18B00");
+      await device.request(5, { sid: U(sid) });
+      await waitUntil(async () => bytes((await device.request(11, { sid: U(sid) })).data).toString("utf8").includes("sz-ended-42"), 15_000, "sz to stop");
+      assert.equal(num((await device.request(4, { sid: U(sid) })).code), 0);
+      device.send(6, { sid: U(sid), data: D("echo back-$((6*7))\r") });
+      await device.waitForOutput(sid, "back-42");
+      await assertPaneClean(device, sid);
+      await device.request(8, { sid: U(sid) });
+      await device.close();
+    });
+
+    test("a program run through it that sends no transfer works as it always did", async () => {
+      const device = await connect("Device A");
+      const sid = num((await device.request(3, { cols: U(80), rows: U(24), cwdpath: host })).sid);
+      await sleep(1000);
+      device.send(6, { sid: U(sid), data: D(`${WRAP} sh -c 'printf "%s\\n" wrapped-$((5*5)); exit 3'; echo status-$?\r`) });
+      await device.waitForOutput(sid, "status-3");
+      assert.match(device.output(sid), /wrapped-25/);
+      await device.request(8, { sid: U(sid) });
+      await device.close();
+    });
+
+    // What it is for: ssh from a herdr pane to a server, then rz and sz
+    // there. The server is an sshd of the test's own, as this user, on a
+    // port of its own, with keys of its own; ~/.ssh is not touched.
+    describe("over ssh", () => {
+      let sshd = null;
+      let keys;
+      let ssh;
+      before(async () => {
+        if (!fs.existsSync("/usr/sbin/sshd")) return;
+        keys = fs.mkdtempSync(path.join(os.tmpdir(), "ghostvt-sshd-"));
+        for (const name of ["host_key", "client_key"]) spawnSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", path.join(keys, name)]);
+        fs.copyFileSync(path.join(keys, "client_key.pub"), path.join(keys, "authorized_keys"));
+        const sshPort = await new Promise((resolve) => {
+          const probe = net.createServer().listen(0, "127.0.0.1", () => {
+            const { port: free } = probe.address();
+            probe.close(() => resolve(free));
+          });
+        });
+        fs.writeFileSync(path.join(keys, "sshd_config"), [
+          `Port ${sshPort}`, "ListenAddress 127.0.0.1", `HostKey ${path.join(keys, "host_key")}`,
+          `AuthorizedKeysFile ${path.join(keys, "authorized_keys")}`, "PasswordAuthentication no",
+          "KbdInteractiveAuthentication no", "UsePAM no", "StrictModes no", `PidFile ${path.join(keys, "sshd.pid")}`, "",
+        ].join("\n"));
+        sshd = spawn("/usr/sbin/sshd", ["-D", "-f", path.join(keys, "sshd_config"), "-E", path.join(keys, "sshd.log")], { stdio: "ignore" });
+        ssh = ["-F", "/dev/null", "-i", path.join(keys, "client_key"), "-o", "UserKnownHostsFile=/dev/null",
+          "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=ERROR", "-p", String(sshPort), "127.0.0.1"];
+        await waitUntil(() => spawnSync("ssh", [...ssh, "-o", "BatchMode=yes", "true"]).status === 0, 10_000, "sshd").catch(() => {
+          sshd.kill();
+          sshd = null;
+        });
+      });
+      after(() => {
+        sshd?.kill();
+        if (keys) fs.rmSync(keys, { recursive: true, force: true });
+      });
+
+      test("sz and rz on a server reached by ssh from a pane", async (context) => {
+        if (!sshd) return context.skip("no sshd of the test's own could start");
+        const which = (program) => spawnSync("sh", ["-c", `command -v ${program}`]).stdout.toString().trim();
+        // The shell's parent: sshd's on the server, herdr's in the pane.
+        const PARENT = "$(basename \"$(ps -o comm= -p $PPID)\")";
+        const device = await connect("Device A");
+        const sid = num((await device.request(3, { cols: U(80), rows: U(24), cwdpath: host })).sid);
+        await sleep(1000);
+        device.send(6, { sid: U(sid), data: D(`${WRAP} ssh ${ssh.map((word) => `'${word}'`).join(" ")}\r`) });
+        await sleep(1500);
+        device.send(6, { sid: U(sid), data: D(`echo remote-$((3*11))-${PARENT}\r`) });
+        await device.waitForOutput(sid, "remote-33-sshd", 15_000);
+
+        const down = crypto.randomBytes(500_000);
+        fs.writeFileSync(path.join(host, "ssh-down.bin"), down);
+        const received = zmodemPeer(device, sid, ["rz", "-y"], local);
+        device.send(6, { sid: U(sid), data: D(`cd '${host}' && '${which("sz")}' ssh-down.bin\r`) });
+        const download = await received;
+        assert.equal(download.code, 0, download.errors);
+        assert.deepEqual(fs.readFileSync(path.join(local, "ssh-down.bin")), down);
+
+        const up = crypto.randomBytes(200_000);
+        fs.writeFileSync(path.join(local, "ssh-up.bin"), up);
+        const sent = zmodemPeer(device, sid, ["sz", "-e", "ssh-up.bin"], local);
+        device.send(6, { sid: U(sid), data: D(`'${which("rz")}' -y\r`) });
+        const upload = await sent;
+        assert.equal(upload.code, 0, upload.errors);
+        await waitUntil(() => fs.existsSync(path.join(host, "ssh-up.bin")) && fs.statSync(path.join(host, "ssh-up.bin")).size === up.length, 10_000, "the file");
+        assert.deepEqual(fs.readFileSync(path.join(host, "ssh-up.bin")), up);
+
+        // Typing that reaches the server before rz has read its "OO" and
+        // exited is lost with rz's terminal settings; a person types later.
+        await sleep(1000);
+        device.send(6, { sid: U(sid), data: D("echo after-$((8*8))\r") });
+        await device.waitForOutput(sid, "after-64");
+        await assertPaneClean(device, sid);
+        // Out of ssh, the pane's own shell again.
+        device.send(6, { sid: U(sid), data: D("exit\r") });
+        await sleep(800);
+        device.send(6, { sid: U(sid), data: D(`echo local-$((9*9))-${PARENT}\r`) });
+        await device.waitForOutput(sid, "local-81-");
+        assert.doesNotMatch(device.output(sid), /local-81-sshd/);
+        await device.request(8, { sid: U(sid) });
+        await device.close();
+      });
+    });
   });
 
   test("a restart hands the port to a fresh daemon, and devices come back", async () => {

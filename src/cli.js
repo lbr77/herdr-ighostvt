@@ -9,10 +9,11 @@
 //   node src/cli.js rename [name]
 //   node src/cli.js update [--check]        installs the newest release (or only looks)
 //   node src/cli.js start | stop | restart
+//   node src/cli.js zmodem                  the line for ~/.zshrc that lets rz/sz reach a device
 
 import fs from "node:fs";
 import { command, ensureDaemon, isRunning } from "./daemon/control.js";
-import { describeUpdate } from "./daemon/updater.js";
+import { PLUGIN_ROOT, describeUpdate } from "./daemon/updater.js";
 
 const [verb, ...rest] = process.argv.slice(2);
 
@@ -100,8 +101,14 @@ try {
       process.stdout.write("restarted\n");
       break;
     }
+    case "zmodem": {
+      // Single quotes, for a path with spaces in it.
+      const file = `${PLUGIN_ROOT}/shell/zmodem.sh`.replace(/'/g, "'\\''");
+      process.stdout.write(`. '${file}'\n`);
+      break;
+    }
     default:
-      process.stderr.write("usage: cli.js status|pair [--relay]|unpair <id>|relay import <file>|relay remove|rename [name]|update [--check]|start|stop|restart\n");
+      process.stderr.write("usage: cli.js status|pair [--relay]|unpair <id>|relay import <file>|relay remove|rename [name]|update [--check]|start|stop|restart|zmodem\n");
       process.exitCode = 2;
   }
 } catch (error) {

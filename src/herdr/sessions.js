@@ -17,6 +17,10 @@
 // `ooff`): a device whose link drops and comes back within the grace period
 // names how much of it its terminal holds, and gets exactly the rest
 // (`ores`) — no redraw, no history written again.
+//
+// A ZMODEM transfer (rz, sz) cannot cross herdr's rendering; it comes by
+// way of src/zmodem/wrap.js instead and goes into the same stream (see
+// "ZMODEM" below).
 
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
@@ -26,8 +30,9 @@ import { Controller } from "./controller.js";
 import { compactFrame } from "./frames.js";
 import { paneSize } from "./ttysize.js";
 import { MOUSE_OFF, MOUSE_ON, splitMouse } from "./mouse.js";
-import { EventStream, HerdrError, herdr } from "./api.js";
+import { EventStream, HerdrError, herdr, socketPath } from "./api.js";
 import { readJSON, writeFileAtomic } from "../store.js";
+import { sameSocket } from "../daemon/control.js";
 import { CODE, MAXIMUM_COLUMNS, MAXIMUM_ROWS, RECONNECT_GRACE_MS } from "../remote/protocol.js";
 
 const FIRST_FRAME_TIMEOUT_MS = 8000;
@@ -64,6 +69,9 @@ const CLEAN_SLATE = Buffer.from("\x1b[?2026l\x1b[?1049l\x1b[!p\x1b[H\x1b[2J\x1b[
 /// A command a device opens a terminal for is typed once the shell shows
 /// its prompt, or after this long regardless.
 const PROMPT_WAIT_MS = 3000;
+/// What stops a ZMODEM program on the other end, as lrzsz's own cancel:
+/// a run of CAN, then backspaces over it in case a shell reads it instead.
+const ZMODEM_CANCEL = Buffer.from("\x18".repeat(10) + "\b".repeat(10), "latin1");
 const SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "elvish", "xonsh", "pwsh", "login"]);
 
 /// What a session's holder has been sent, as one stream (`ooff`): where it
@@ -159,6 +167,8 @@ class Session {
     /// Output held back until the open/attach reply has gone out.
     this.gate = null;
     this.lingerTimer = null;
+    /// The ZMODEM transfer under way ({socket, deferred}), or null.
+    this.transfer = null;
   }
 
   /// The stream is over: its controller is gone or replaced.
@@ -347,6 +357,8 @@ export class SessionRegistry extends EventEmitter {
     this.log(`session ${session.sid} ended: ${why}`);
     this.sessions.delete(session.sid);
     clearTimeout(session.lingerTimer);
+    // The terminal is gone, and the program with it: nothing to stop.
+    this.abortTransfer(session, { cancel: false });
     const holder = session.holder;
     session.holder = null;
     if (session.controller) {
@@ -556,6 +568,9 @@ export class SessionRegistry extends EventEmitter {
   /// Resolves with where its output stream starts and, with `replay`, what
   /// the device should be shown first.
   async hold(session, peer, { takeover, cols, rows, replay = false }) {
+    // The screen is shown afresh: a transfer can only carry on for the
+    // device whose link comes back to it (`resume`).
+    this.abortTransfer(session);
     const old = session.controller;
     if (old) {
       // Replaced by the new one's takeover: its end is not news.
@@ -669,8 +684,9 @@ export class SessionRegistry extends EventEmitter {
     if (!session?.gate) return;
     const held = session.gate;
     session.gate = null;
-    for (const bytes of held) this.send(session, bytes);
+    for (const bytes of held) this.sendInOrder(session, bytes);
     this.scheduleSync(session);
+    this.flowTransfer(session);
   }
 
   deliver(session, controller, frame) {
@@ -681,6 +697,9 @@ export class SessionRegistry extends EventEmitter {
     }
     // The program drew: the next wheel step may go.
     this.wheelDrawn(session);
+    // In the middle of a transfer the device's engine would take a frame
+    // for part of it; the screen is painted again once it ends.
+    if (session.transfer) return;
     if (session.awaitingFull) {
       // The device's screen is not the one these changes are against (it
       // was cleared to push history into its scrollback, or frames were
@@ -828,7 +847,7 @@ export class SessionRegistry extends EventEmitter {
 
   async syncHistory(session) {
     const controller = session.controller;
-    if (!controller || !session.holder || session.holder.peer.closed || session.gate || !session.paneID) return;
+    if (!controller || !session.holder || session.holder.peer.closed || session.gate || !session.paneID || session.transfer) return;
     session.syncing = true;
     try {
       const pane = await herdr.paneGet(session.paneID);
@@ -856,7 +875,7 @@ export class SessionRegistry extends EventEmitter {
       const count = Math.min(total - session.historySent, SYNC_LINES);
       const lines = await this.historyLines(session, count);
       session.historySent = total;
-      if (!lines || session.controller !== controller || session.gate || !session.holder) return;
+      if (!lines || session.controller !== controller || session.gate || !session.holder || session.transfer) return;
       this.send(session, Buffer.from(`\x1b[?2026h\x1b[0m\x1b[H\x1b[2J${lines.join("\r\n")}\x1b[0m${"\r\n".repeat(session.rows)}`, "utf8"));
       session.updateOpen = true;
       this.requestRepaint(session, controller);
@@ -916,9 +935,21 @@ export class SessionRegistry extends EventEmitter {
     this.send(target, Buffer.from(`\x1b]52;c;${bytes.toString("base64")}\x07`));
   }
 
-  /// Output for the session's holder. Kept in its stream even while its
-  /// link is down, for the device to be handed when it comes back.
+  /// Output for the session's holder. During a transfer, it waits for its
+  /// end: the device's engine would read it as part of the transfer.
   send(session, bytes) {
+    if (!bytes.length) return;
+    if (session.transfer) {
+      session.transfer.deferred.push(bytes);
+      return;
+    }
+    this.sendInOrder(session, bytes);
+  }
+
+  /// Output for the session's holder, in the order it comes. Kept in its
+  /// stream even while its link is down, for the device to be handed when
+  /// it comes back.
+  sendInOrder(session, bytes) {
     if (!bytes.length) return;
     if (session.gate) {
       session.gate.push(bytes);
@@ -939,6 +970,7 @@ export class SessionRegistry extends EventEmitter {
   /// device closes the tab.
   async controllerClosed(session, controller, { reason, taken }) {
     if (session.controller !== controller) return;
+    this.abortTransfer(session);
     session.controller = null;
     session.endStream();
     session.gate = null;
@@ -971,6 +1003,7 @@ export class SessionRegistry extends EventEmitter {
   }
 
   letGo(session) {
+    this.abortTransfer(session);
     clearTimeout(session.lingerTimer);
     session.lingerTimer = null;
     clearTimeout(session.slotTimer);
@@ -1081,7 +1114,7 @@ export class SessionRegistry extends EventEmitter {
     // Nothing waits for a reply that cannot arrive; into the stream it goes.
     const held = session.gate ?? [];
     session.gate = null;
-    for (const bytes of held) this.send(session, bytes);
+    for (const bytes of held) this.sendInOrder(session, bytes);
     clearTimeout(session.lingerTimer);
     session.lingerTimer = setTimeout(() => {
       if (session.holder?.peer === peer) this.letGo(session);
@@ -1104,7 +1137,104 @@ export class SessionRegistry extends EventEmitter {
       if (session.holder?.peer !== peer || !session.controller) continue;
       const stdout = session.controller.child.stdout;
       paused ? stdout.pause() : stdout.resume();
+      this.flowTransfer(session);
     }
+  }
+
+  // MARK: - ZMODEM
+  //
+  // herdr renders a program's output and passes none of it on, so rz and sz
+  // in a pane reach the device through src/zmodem/wrap.js: it hands the
+  // transfer's bytes to the bridge (src/zmodem/server.js), and they go to
+  // the pane's holder as its output — into the same stream as the frames,
+  // so a link that drops and comes back carries on in the middle of it, as
+  // the device's engine expects. Nothing else goes meanwhile (the engine
+  // would take it for part of the transfer): herdr's frames are dropped and
+  // the screen painted again at the end, and other output waits for it. The
+  // device's answers go in as all its typing does, byte for byte.
+
+  /// A transfer the program `pid` in `pane` began. Throws when no device
+  /// has the pane open.
+  async beginTransfer({ pane, herdr: herdrSocket, pid, program }, socket, rest = Buffer.alloc(0)) {
+    if (herdrSocket && !sameSocket(herdrSocket, socketPath())) throw new Error("that pane is another herdr server's");
+    const session = await this.sessionOfProgram(pane, pid);
+    if (!session) throw new Error("no device has this pane open");
+    if (session.transfer) throw new Error("a transfer is under way in this pane");
+    if (socket.destroyed) return;
+    const transfer = { socket, deferred: [] };
+    session.transfer = transfer;
+    clearTimeout(session.slotTimer);
+    session.slotTimer = null;
+    session.held = [];
+    session.heldBytes = 0;
+    this.log(`session ${session.sid}: ${program || "a program"} began a ZMODEM transfer`);
+    socket.on("data", (chunk) => this.transferData(session, transfer, chunk));
+    socket.on("end", () => this.endTransfer(session, transfer));
+    socket.on("close", () => this.endTransfer(session, transfer));
+    this.transferData(session, transfer, rest);
+  }
+
+  /// The session `pid` runs in the front of, held by a device. The pane's
+  /// id comes first (the program's HERDR_PANE_ID), but a pane moved since
+  /// its shell started may have another, so the front of every held pane
+  /// is looked at for the program.
+  async sessionOfProgram(paneID, pid) {
+    const held = [...this.sessions.values()].filter((session) => session.holder && session.controller && session.paneID);
+    held.sort((a, b) => (b.paneID === paneID) - (a.paneID === paneID));
+    for (const session of held) {
+      try {
+        const info = await herdr.processInfo(session.paneID);
+        if ((info.foreground_processes ?? []).some((entry) => entry.pid === pid)) return session;
+      } catch {
+        if (session.paneID === paneID) return session;
+      }
+    }
+    return null;
+  }
+
+  transferData(session, transfer, bytes) {
+    if (session.transfer !== transfer) return;
+    this.sendInOrder(session, bytes);
+    this.flowTransfer(session);
+  }
+
+  /// The transfer goes no faster than the device's link takes it (its
+  /// window), and waits while the link is down: what the device has not
+  /// seen stays within what a returning link can be handed.
+  flowTransfer(session) {
+    const transfer = session.transfer;
+    if (!transfer) return;
+    const peer = session.holder?.peer;
+    if (!peer || peer.closed || peer.paused || session.gate) transfer.socket.pause();
+    else transfer.socket.resume();
+  }
+
+  /// The program's conversation is over: what waited goes, and the device
+  /// is shown herdr's screen again.
+  endTransfer(session, transfer) {
+    if (session.transfer !== transfer) return;
+    session.transfer = null;
+    if (!transfer.socket.destroyed) transfer.socket.end();
+    this.log(`session ${session.sid}: the ZMODEM transfer ended`);
+    for (const bytes of transfer.deferred) this.send(session, bytes);
+    const controller = session.controller;
+    if (!controller || !session.holder) return;
+    this.requestRepaint(session, controller);
+    this.scheduleSync(session);
+  }
+
+  /// The device let go in the middle of a transfer: the program on the
+  /// other end is told to stop (`cancel`), and what it still sends is
+  /// dropped by wrap.js.
+  abortTransfer(session, { cancel = true } = {}) {
+    const transfer = session.transfer;
+    if (!transfer) return;
+    session.transfer = null;
+    this.log(`session ${session.sid}: the device let go during a ZMODEM transfer${cancel ? "; cancelling it" : ""}`);
+    transfer.socket.destroy();
+    if (!cancel) return;
+    if (session.controller && !session.controller.closed) session.controller.input(ZMODEM_CANCEL);
+    else if (session.paneID) herdr.sendText(session.paneID, ZMODEM_CANCEL.toString("latin1")).catch(() => {});
   }
 
   /// The lines above the screen, ending in enough line feeds to push them
